@@ -21,11 +21,7 @@ An adaptive sampler for ComfyUI: it probes the model's trajectory and
 
 ## Wiring
 
-```
-BasicScheduler ("simple") ──sigmas──▶ Autotuner ──sigmas──▶ SamplerCustomAdvanced
-guider ────────────────────────────▶ Autotuner ──options─▶ A-FloPS Sampler (options+)
-                                                          A-FloPS Sampler ──sampler──▶ SamplerCustomAdvanced
-```
+![Wiring example: BasicScheduler → A-FloPS Autotuner → SamplerCustomAdvanced, with the A-FloPS Sampler fed by the Autotuner's options](docs/wiring-example.png)
 
 Step by step:
 
@@ -37,6 +33,13 @@ Step by step:
    and Sampler `sampler` → `SamplerCustomAdvanced.sampler`.
 5. The first run probes the model + prompt (tiny latents, cached per
    model/prompt/schedule); later runs reuse the measurements.
+
+In the screenshot: a Text Encoding (guider) node feeds the Autotuner's
+`guider` and the Sampler's `model`; BasicScheduler ("simple", 50 steps,
+denoise 1.00) feeds the Autotuner's `sigmas`; the Autotuner's `sigmas` goes
+to `SamplerCustomAdvanced.sigmas` and its `options` goes to the A-FloPS
+Sampler's `options+`; the A-FloPS Sampler supplies
+`SamplerCustomAdvanced.sampler`.
 
 With no usable probe evidence the Autotuner passes your schedule through
 untouched — your scheduler is always the baseline.
