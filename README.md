@@ -1,26 +1,45 @@
-# A-FloPS for ComfyUI
+# A-FloPS Autotuner for ComfyUI
 
-A-FloPS (Adaptive Flow Path Sampler): a ComfyUI custom sampler that probes
-the model's trajectory and fine-tunes your sigma schedule to it.
+An adaptive sampler for ComfyUI: it probes the model's trajectory and
+**fine-tunes whatever sigma schedule you plug in** (e.g. BasicScheduler
+"simple") so the steps land where the measured curvature needs them.
+
+> **Tested only with Krea 2 and Anima (preview) models.** Other flow models
+> are expected to work but have not been verified.
 
 ## Nodes
 
 - **A-FloPS Autotuner** — probes + schedule fine-tune in one node.
-  Connect the guider and any scheduler's sigmas (e.g. BasicScheduler
-  "simple"); it measures the model and the prompt's trajectory at the
-  schedule's noise levels, then re-allocates the steps of your sigma list
-  where the measured curvature needs them. Flat curvature reproduces your
-  list exactly. Elementary knobs only: probe steps, probe resolution, and
-  the shift bias (1.0 = pure error-optimal placement).
-- **A-FloPS Sampler** — the sampling engine (stochasticity + log toggle).
-- **A-FloPS Error Report** — per-step internal decisions as JSON.
+  - Inputs: `guider` (the run's guider), `sigmas` (any scheduler's output).
+  - Outputs: `sigmas` (fine-tuned), `options` (for the Sampler).
+  - Knobs: `probe_steps` (min 5), `probe_resolution`, `shift` (1.0 = pure
+    error-optimal placement; >1 = more high-sigma structure steps, <1 = more
+    low-sigma detail steps).
+- **A-FloPS Sampler** — the sampling engine. Knobs: `stochasticity`,
+  `log_errors`. Connect the Autotuner's `options` to its `options+` input.
+- **A-FloPS Error Report** — optional; dumps per-step decisions as JSON.
 
 ## Wiring
 
 ```
 BasicScheduler ("simple") ──sigmas──▶ Autotuner ──sigmas──▶ SamplerCustomAdvanced
-guider ─────────────────────────────▶ Autotuner ──options─▶ A-FloPS Sampler (options+)
+guider ────────────────────────────▶ Autotuner ──options─▶ A-FloPS Sampler (options+)
+                                                          A-FloPS Sampler ──sampler──▶ SamplerCustomAdvanced
 ```
+
+Step by step:
+
+1. Build a normal `SamplerCustomAdvanced` graph (model → noise → guider → sampler → sigmas).
+2. Add **A-FloPS Autotuner**: connect your guider to `guider`, connect your
+   scheduler's output (e.g. BasicScheduler "simple") to `sigmas`.
+3. Connect Autotuner `sigmas` → `SamplerCustomAdvanced.sigmas`.
+4. Add **A-FloPS Sampler**: connect Autotuner `options` → Sampler `options+`,
+   and Sampler `sampler` → `SamplerCustomAdvanced.sampler`.
+5. The first run probes the model + prompt (tiny latents, cached per
+   model/prompt/schedule); later runs reuse the measurements.
+
+With no usable probe evidence the Autotuner passes your schedule through
+untouched — your scheduler is always the baseline.
 
 ## Install
 
