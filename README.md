@@ -82,8 +82,14 @@ per step. They are not needed for normal use.
 3. Connect the Autotuner's `sigmas` output to `SamplerCustomAdvanced.sigmas`.
 4. Add **A-FloPS Sampler**: connect the Autotuner's `options` output to its
    `options+` input, and its `sampler` output to `SamplerCustomAdvanced.sampler`.
+   The Sampler's own `model` input is optional: connecting the model there lets it
+   read the model's type and settings directly. The Autotuner needs no such input,
+   because it receives the model through the guider.
 5. Run. The first generation probes the model and the prompt and stores the
    measurements; later generations with the same model and settings reuse them.
+
+The screenshot above is that graph for a 16-step run, with `order_by_bound` on,
+`order_floor` at 6, `lf_ab` on and `auto_warp` on.
 
 ## Notes
 
