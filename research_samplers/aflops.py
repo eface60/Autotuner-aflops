@@ -37,6 +37,29 @@ if _AFLOPS_TF32_OFF:
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     except Exception:
         pass
+# ---- attention-backend determinism ----------------------------------------
+# The flags above cover cudnn, cublas and matmul reductions, but NOT the
+# attention path -- and that is where the remaining non-determinism lives.
+# PyTorch's MEMORY-EFFICIENT SDPA backend accumulates with atomics and is
+# documented as non-deterministic in the FORWARD pass; the flash and math
+# backends are deterministic.
+#
+# The symptom this targets, measured: two Anima/CFG5 runs with an IDENTICAL
+# selected profile and an identical step-1 input still disagree at the FIRST
+# model call -- x0_rms reads 1.449564 / 0.657451 / 0.592164 / 0.598357 across
+# logs 35-42, which all share profile hash d411cc1f0e -- so the divergence is in
+# the forward pass, not in the stepping arithmetic.  Krea2/CFG1 is
+# bit-reproducible by contrast (logs 71 == 73, 0 of 16 steps differ).
+#
+# AFLOPS_DET_SDPA=0 restores the default backends: faster, but not
+# reproducible.  Like the block above this is a GLOBAL torch setting and affects
+# the whole ComfyUI process; the tradeoff is attention speed, not correctness.
+if os.environ.get("AFLOPS_DET_SDPA", "1") == "1":
+    for _fn in ("enable_mem_efficient_sdp", "enable_cudnn_sdp"):
+        try:
+            getattr(torch.backends.cuda, _fn)(False)
+        except Exception:
+            pass
 try:
     from .common import exact_step as _exact_step_ext
 except Exception:
@@ -49,6 +72,116 @@ _COND_PROBE_PROFILES = {}  # (model_key, cond_sig) -> per-prompt profile
 _COND_PROBE_PROFILES_SCHED = {}
 _NODE_PROBE_PROFILES = {}  # (model_key, param_sig, cfg_sig) -> node-side profile
 _EXACT_STEP_STATUS = "unverified"
+
+
+# ---------------------------------------------------------------------------
+# Build provenance: ties a saved report / console log to the exact code that
+# produced it.
+#
+# The live node is a COPY of the repo (it has no .git), so a commit hash cannot
+# be read at runtime.  The primary key is therefore a hash of the SOURCE FILES
+# themselves -- which also catches local edits that never became a commit --
+# with the git commit and branch attached as a bonus whenever a repo IS
+# reachable (i.e. when running from the workspace checkout).
+#
+# _src_hash_from is deliberately shared with scratch_build_id_tool.py, so a
+# hash computed from git blobs can be matched against one computed from live
+# files and vice versa.  Keep _BUILD_SRC_FILES in sync with that tool.
+# ---------------------------------------------------------------------------
+_BUILD_SRC_FILES = (
+    "__init__.py",
+    "nodes.py",
+    "research_samplers/aflops.py",
+    "research_samplers/paper_aeuler.py",
+)
+
+
+def _src_hash_from(items):
+    """items: iterable of (relpath, bytes) in _BUILD_SRC_FILES order.
+
+    Line endings are normalised, because git stores LF blobs while a Windows
+    worktree (and the copied live node) may be CRLF -- without this, a hash of
+    the live files would never match a hash of the committed blobs.
+    """
+    h = hashlib.sha256()
+    for rel, data in items:
+        h.update(rel.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(data.replace(b"\r\n", b"\n"))
+        h.update(b"\x00")
+    return h.hexdigest()[:12]
+
+
+def _git_head_of(start_dir, levels=2):
+    """(commit12, branch) read straight out of .git/HEAD -- no subprocess."""
+    d = os.path.abspath(start_dir)
+    for _ in range(max(1, levels)):
+        g = os.path.join(d, ".git")
+        try:
+            with open(os.path.join(g, "HEAD"), "r", encoding="utf-8") as fh:
+                head = fh.read().strip()
+        except Exception:
+            parent = os.path.dirname(d)
+            if parent == d:
+                return None, None
+            d = parent
+            continue
+        if not head.startswith("ref:"):
+            return (head[:12] or None), "(detached)"
+        ref = head.split(" ", 1)[1].strip()
+        branch = ref.rsplit("/", 1)[-1]
+        try:
+            with open(os.path.join(g, *ref.split("/")), "r",
+                      encoding="utf-8") as fh:
+                return fh.read().strip()[:12], branch
+        except Exception:
+            pass
+        try:  # packed refs
+            with open(os.path.join(g, "packed-refs"), "r",
+                      encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.startswith(("#", "^")) and \
+                            line.strip().endswith(ref):
+                        return line.split()[0][:12], branch
+        except Exception:
+            pass
+        return None, branch
+    return None, None
+
+
+def _build_identity():
+    """Provenance block stamped into every report (and logged once at import)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    items = []
+    missing = []
+    for rel in _BUILD_SRC_FILES:
+        try:
+            with open(os.path.join(root, *rel.split("/")), "rb") as fh:
+                items.append((rel, fh.read()))
+        except Exception:
+            missing.append(rel)
+    commit, branch = _git_head_of(root)
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        ts = None
+    return {
+        "src_hash": _src_hash_from(items) if items else None,
+        "src_files": [r for r, _ in items],
+        "src_missing": missing,
+        "git_commit": commit,
+        "git_branch": branch,
+        "stamped_utc": ts,
+    }
+
+
+_BUILD = _build_identity()
+logging.info("[A-FloPS] build src=%s git=%s@%s files=%d%s",
+             _BUILD.get("src_hash"), _BUILD.get("git_commit"),
+             _BUILD.get("git_branch"), len(_BUILD.get("src_files") or []),
+             (" missing=%s" % ",".join(_BUILD["src_missing"]))
+             if _BUILD.get("src_missing") else "")
 
 def _exact_step_local(x, x0, s, s2):
     r = float(s2) / max(float(s), 1e-12)
@@ -507,6 +640,14 @@ def _extract_model_info(model):
         return None
 
 _PROBE_RANK_CACHE = {}
+# Why the probe rank came out the way it did.  The node-invoked probes build a
+# 4-D latent while these models need 5-D, and a 4-D input is a pass-through --
+# so the rank DECISION is the thing to measure, not the resulting x_shape.
+_PROBE_RANK_DIAG = {}
+# The most recent shape decision, bound to the latent it produced (see
+# _probe_latent_shape).  Read by _probe_model_call so the probe reports the
+# reason for ITS input's rank, not whatever ran last.
+_LAST_SHAPE_DIAG = {}
 
 def _probe_rank_key(patcher):
     try:
@@ -527,48 +668,122 @@ def _remember_probe_rank(patcher, rank):
         pass
 
 def _detect_probe_rank(patcher, mi=None):
+    # Records WHY it reached its verdict, so the next run MEASURES the cause
+    # instead of inferring it from the resulting x_shape.  Written to a SUB-dict
+    # so a later detection cannot clobber a resolution another call recorded.
+    _d = {"mi_ld": None, "mi_src": None, "lf_ld": None, "uc_temporal": [],
+          "uc_keys": None, "pattern_hit": None, "pattern_tried": 0,
+          "verdict": None, "rule": None}
+    _PROBE_RANK_DIAG["detect"] = _d
     if patcher is None:
+        _d["rule"] = "patcher-is-None"
         return None
     try:
         if mi is None:
             try:
                 mi = _extract_model_info(patcher)
+                # ONLY claim "extracted" when something was actually returned.  This
+                # used to be set straight after the CALL, with no check on the result,
+                # so it read "extracted" in exactly the failing case -- the corpus pairs
+                # `no-detector-fired` with `mi_ld: null` AND `mi_src: "extracted"`,
+                # i.e. the provenance stated the opposite of the truth.
+                _d["mi_src"] = "extracted" if mi is not None else "extracted-None"
             except Exception:
                 mi = None
+                _d["mi_src"] = "extract-failed"
+        else:
+            _d["mi_src"] = "passed-in"
         if mi is not None:
             try:
                 ld = int(mi.get("latent_dimensions") or 0)
             except (TypeError, ValueError):
                 ld = 0
+            _d["mi_ld"] = ld
             if ld >= 3:
+                _d["verdict"] = 5
+                _d["rule"] = "model_info.latent_dimensions>=3"
                 return 5
-    except Exception:
-        pass
+    except Exception as e:
+        _d["mi_src"] = "raised:" + type(e).__name__
+    # ---- THE DECLARATION, READ FROM THE MODEL ITSELF ------------------------
+    # `latent_dimensions` is declared per format in ComfyUI's OWN source
+    # (comfy/latent_formats.py:4-7) and the latent rank is 2 + it: 3 for the
+    # video/temporal formats (Wan21, Mochi, LTXV, HunyuanVideo, Cosmos1CV8x8x8,
+    # CogVideoX, SeedVR2), 2 for images, 1 for audio/3D.  The block above reads the
+    # same field, but only THROUGH `mi` -- and on the real corpus `mi` is None
+    # (`mi_ld: null`), so the definitive route was skipped and the detector fell
+    # through to the two weak ones and then to the caller's `return 4` fallback: a 4-D
+    # latent through a 5-D model is a SILENT PASS-THROUGH, which is the frozen probe,
+    # which is every derived calibration computed from zeros.  Reading the declaration
+    # from the patcher removes the dependency on a lookup that can return None.
+    #
+    # IT CAN ONLY PROMOTE.  `>= 3` returns 5; anything else FALLS THROUGH rather than
+    # returning 4, so a temporal `unet_config` can still win (a model may carry temporal
+    # patching its format does not advertise) and an image model still reaches the
+    # caller's fallback unchanged.  Asserted in scratch_rank_declaration_rig.py.
+    try:
+        _lf = patcher.get_model_object("latent_format")
+        _raw = getattr(_lf, "latent_dimensions", None)
+        _d["lf_ld"] = _raw
+        # COERCE, DO NOT TYPE-CHECK.  The first version of this route tested
+        # `isinstance(_ld, int)`, which is FALSE for a float `3.0` and for int-LIKE
+        # objects (numpy scalars, enums, wrappers) -- both perfectly legal declarations
+        # -- so the route silently declined to fire for them.  A silently-declined
+        # route is INDISTINGUISHABLE from a model that genuinely is 4-D, which is the
+        # exact failure class this route exists to remove, so the check must be
+        # numeric and the raw value must still be recorded.  Caught by the edge-case
+        # section of scratch_rank_declaration_rig.py, not by the happy path.
+        _ld = None
+        try:
+            if _raw is not None:
+                _ld = int(_raw)          # bool True -> 1, floats/ints/np scalars all work
+        except (TypeError, ValueError):
+            _ld = None                   # non-numeric: fall through, raw already recorded
+        if _ld is not None and _ld >= 3:
+            _d["verdict"] = 5
+            _d["rule"] = "latent_format.latent_dimensions>=3"
+            return 5
+    except Exception as e:
+        _d["lf_ld"] = "raised:" + type(e).__name__
     try:
         uc = patcher.get_model_object("model_config").unet_config or {}
-        if isinstance(uc, dict) and (("patch_temporal" in uc)
-                                     or ("max_frames" in uc)
-                                     or ("temporal_patch_size" in uc)):
-            return 5
-    except Exception:
-        pass
+        if isinstance(uc, dict):
+            _d["uc_keys"] = sorted(str(k) for k in uc.keys())[:24]
+            _hits = [k for k in ("patch_temporal", "max_frames",
+                                 "temporal_patch_size") if k in uc]
+            _d["uc_temporal"] = _hits
+            if _hits:
+                _d["verdict"] = 5
+                _d["rule"] = "unet_config:" + ",".join(_hits)
+                return 5
+    except Exception as e:
+        _d["uc_keys"] = "raised:" + type(e).__name__
     try:
         dm = patcher.get_model_object("diffusion_model")
         for _n, mod in dm.named_modules():
+            _d["pattern_tried"] += 1
             pat = getattr(mod, "pattern", None)
             if isinstance(pat, str) and "(t" in pat and "(h" in pat \
                     and "(w" in pat:
+                _d["pattern_hit"] = pat[:60]
+                _d["verdict"] = 5
+                _d["rule"] = "module.pattern"
                 return 5
-    except Exception:
-        pass
+    except Exception as e:
+        _d["pattern_hit"] = "raised:" + type(e).__name__
+    _d["rule"] = "no-detector-fired"
     return None
 
 def _resolve_probe_rank(patcher, ref_x=None, mi=None):
+    _rank_src = None
     try:
         k = _probe_rank_key(patcher)
         if k is not None:
             v = _PROBE_RANK_CACHE.get(k)
             if v in (4, 5):
+                _rank_src = "cache[{}]".format(k[:24])
+                _PROBE_RANK_DIAG["resolve_src"] = _rank_src
+                _PROBE_RANK_DIAG["resolve_rank"] = int(v)
                 return int(v)
     except Exception:
         pass
@@ -576,15 +791,24 @@ def _resolve_probe_rank(patcher, ref_x=None, mi=None):
         if torch.is_tensor(ref_x):
             d = int(ref_x.dim())
             if d in (4, 5):
+                _PROBE_RANK_DIAG["resolve_src"] = "ref_x.dim()"
+                _PROBE_RANK_DIAG["resolve_rank"] = d
+                _PROBE_RANK_DIAG["ref_x_shape"] = tuple(int(v) for v in ref_x.shape)
                 return d
     except Exception:
         pass
     try:
         r = _detect_probe_rank(patcher, mi)
         if r in (4, 5):
+            _PROBE_RANK_DIAG["resolve_src"] = "detect"
+            _PROBE_RANK_DIAG["resolve_rank"] = int(r)
             return r
     except Exception:
         pass
+    # THE FALLBACK.  A 5-D model given this rank is a pass-through, so record
+    # loudly that the decision was made by default and not by detection.
+    _PROBE_RANK_DIAG["resolve_src"] = "FALLBACK-4 (no detector fired)"
+    _PROBE_RANK_DIAG["resolve_rank"] = 4
     return 4
 
 def _probe_rank_ladder(patcher, ref_x=None, mi=None):
@@ -607,8 +831,75 @@ def _probe_rank_ladder(patcher, ref_x=None, mi=None):
             ladder.append(r)
     return ladder
 
+def _probe_rank_ladder_run(run_at_rank, ladder, degenerate_fn):
+    """Try each rank until one yields a NON-DEGENERATE profile.
+
+    WHY THIS IS DRIVEN BY DEGENERACY AND NOT BY EXCEPTIONS
+    -----------------------------------------------------
+    The node-side probes pass `ref_x=None`, so the rank comes from
+    `_detect_probe_rank`, which only recognises a model whose `unet_config`
+    advertises temporal keys.  For every other 5-D model it fails and
+    `_resolve_probe_rank` returns its `return 4` fallback -- and a 4-D latent
+    through a 5-D model RUNS SUCCESSFULLY and returns its input.  Nothing is
+    raised, so `_is_shape_error` never fires and an exception-driven ladder
+    stalls at rank 4 forever, which is the bug this exists to kill.
+
+    The criterion is the profile's own degeneracy, which is a measurement the
+    probe already makes.  On the saved corpus the separation is ~6 orders of
+    magnitude and has NO overlap, so the predicate is not a judgement call:
+
+        frozen  (ret_rel == 0, n=12):  med_jump 0.0      .. 1.11e-08
+        healthy (ret_rel != 0, n=24):  med_jump 4.87e-02 .. 2.70e-01
+        `_probe_degenerate` threshold: 1e-4  (10x above the frozen max,
+                                             487x below the healthy min)
+
+    Returns (profile, rank_used, tried).  `profile` is the FIRST profile seen
+    (even if all were degenerate) so behaviour degrades to the old one rather
+    than to nothing, and `rank_used` is None only if every rank produced None.
+    """
+    tried = []
+    first = None
+    first_rank = None
+    for r in ladder:
+        try:
+            prof = run_at_rank(r)
+        except Exception as e:
+            tried.append(r)
+            logging.info("[A-FloPS-probe] rank %s failed: %s", r, e)
+            continue
+        tried.append(r)
+        if prof is None:
+            continue
+        if first is None:
+            first = prof
+            first_rank = r
+        try:
+            bad = bool(degenerate_fn(prof))
+        except Exception:
+            bad = False
+        if not bad:
+            if len(tried) > 1:
+                logging.info("[A-FloPS-probe] rank ladder: rank %s was "
+                             "degenerate, using rank %s (tried %s)",
+                             tried[0], r, tried)
+            return prof, r, tried
+    return first, first_rank, tried
+
 def _probe_latent_shape(ref_x=None, pres=16, batch=1, rank=None,
-                        channels=None, patcher=None, mi=None):
+                        channels=None, patcher=None, mi=None, site=None):
+    # PER-CALL record of the shape decision.  This used to be inferred from a
+    # global dict that a later call could clobber, which made
+    # `resolve_src=ref_x.dim()` appear on a call site that passes ref_x=None.
+    # Recording at the build itself binds the reason to the latent it produced.
+    _LAST_SHAPE_DIAG.clear()
+    _LAST_SHAPE_DIAG.update({
+        "site": site, "pres": pres, "batch": batch, "rank_arg": rank,
+        "ref_x_is_tensor": bool(torch.is_tensor(ref_x)),
+        "ref_x_dim": (int(ref_x.dim()) if torch.is_tensor(ref_x) else None),
+        "ref_x_shape": (tuple(int(v) for v in ref_x.shape)
+                        if torch.is_tensor(ref_x) else None),
+        "channels_arg": channels, "patcher_is_none": patcher is None,
+    })
     try:
         batch = int(batch)
         if batch < 1:
@@ -632,16 +923,23 @@ def _probe_latent_shape(ref_x=None, pres=16, batch=1, rank=None,
         channels = 4
     if channels < 1:
         channels = 4
+    _out = (batch, channels, pres, pres)
     if rank == 5:
+        _out = (batch, channels, 1, pres, pres)
         try:
             if torch.is_tensor(ref_x) and ref_x.dim() == 5:
                 T = int(ref_x.shape[2])
                 if 0 < T <= 64:
-                    return (batch, channels, T, pres, pres)
+                    _out = (batch, channels, T, pres, pres)
         except Exception:
             pass
-        return (batch, channels, 1, pres, pres)
-    return (batch, channels, pres, pres)
+    _LAST_SHAPE_DIAG.update({
+        "rank_out": int(rank), "out_shape": tuple(int(v) for v in _out),
+        "resolve_src": _PROBE_RANK_DIAG.get("resolve_src"),
+        "detect_rule": _PROBE_RANK_DIAG.get("detect", {}).get("rule")
+        if isinstance(_PROBE_RANK_DIAG.get("detect"), dict) else None,
+    })
+    return _out
 
 def _is_shape_error(e):
     try:
@@ -726,11 +1024,52 @@ def _schedule_sig(x, sigmas, cfg):
         except Exception:
             st = sigmas.detach().to("cpu", torch.float32).contiguous().flatten()
             h.update(str([round(float(v), 8) for v in st]).encode())
-        h.update(("ps=%d,pr=%d" % (int(cfg.get("probe_steps", 10)),
-                                   int(cfg.get("probe_resolution", 48)))).encode())
+        h.update(("ps=%d,pr=%d,pd=%d,wb=%d" % (
+            int(cfg.get("probe_steps", 10)),
+            int(cfg.get("probe_resolution", 48)),
+            int(bool(cfg.get("pct_derived", False))),
+            int(bool(cfg.get("wmax_bound", False))))).encode())
         return h.hexdigest()[:16]
     except Exception:
         return "nologic"
+
+def _sigmas_digest(sigmas):
+    """Full-precision identity of the sigma tensor the sampler CONSUMED.
+
+    Why this exists (DEAD_FEATURES.md sections 13-15): `_ms_info.sigmas_in` is
+    the AUTOTUNER's input rounded to 5 decimals, and each per-step sigma is
+    logged rounded to 6.  Two runs whose schedules differ only below those
+    precisions are therefore indistinguishable in the log -- yet this was
+    measured to be enough to change the image visibly, because the model
+    amplifies a ~1e-6 relative step difference to 0.57% within two steps.
+
+    A measured example: two arms of a scheduler A/B produced arrays that agreed
+    at every stored decimal and still carried different probe cache keys, which
+    forced the whole difference to be *deduced* from a sha1 rather than read.
+    This digest reads the raw bytes, so "the same schedule" becomes checkable.
+    """
+    try:
+        st = sigmas.detach().to("cpu", torch.float32).contiguous().flatten()
+        n = int(st.numel())
+        if n == 0:
+            return {"n": 0}
+        try:
+            payload = st.numpy().tobytes()
+        except Exception:
+            payload = repr([float(v) for v in st]).encode()
+        return {
+            "sha1_16": hashlib.sha1(payload).hexdigest()[:16],
+            "n": n,
+            "dtype": str(getattr(sigmas, "dtype", "?")),
+            # full-precision scalars, not rounded: the digest detects a
+            # difference, these show how big it was
+            "first": float(st[0]),
+            "last": float(st[-1]),
+            "sum_f64": float(st.double().sum()),
+        }
+    except Exception as e:
+        return {"error": type(e).__name__}
+
 
 def _prune_probe_cache(mk, keep=8):
     keys = [k for k in _PROBE_PROFILES if k == mk or k.startswith(mk + "|s:")]
@@ -791,6 +1130,102 @@ def _cond_cache_key(cfg, extra_args, model_key):
         cond_sig = _extra_cond_signature(extra_args)
     return (model_key, str(cond_sig)) if cond_sig else None
 
+# ---------------------------------------------------------------------------
+# A/B experiment switches -- TESTING ONLY, defaults reproduce the engine exactly.
+#
+# Set once per run from cfg by aflops_engine.  Module-level because
+# _compute_trajectory_state is called from six places (2085, 3122, 4223, 4517,
+# 4870, 5573) and every one of them must apply the same rule; threading a
+# parameter through six call sites would risk a site being missed, which is
+# exactly the class of bug this session spent its time fixing.
+#
+#   _OSM_AB_MODE  "engine"     -> the original absolute thresholds (default)
+#                 "reanchored" -> the anchors MEASURED from real profiles, below
+#                 "off"        -> force oversmooth to 0
+#   _EV_AB_MODE   "engine"     -> ev = max(ov, osm) (default)
+#                 "ov_only"    -> ev = ov, isolating the `s` consumer
+#
+# The distilled early-out (`if is_distilled: oversmooth = 0.0`) was REMOVED at
+# the operator's request, so the A/B can test whether distilled models
+# over-smooth at all.  Note the removal alone changes nothing: in "engine" mode
+# the original thresholds still gate every distilled profile to 0, so a run with
+# default settings behaves exactly as before.
+_OSM_AB_MODE = "engine"
+_EV_AB_MODE = "engine"
+
+# Anchors MEASURED from 9 real non-distilled profiles by
+# scratch_oversmooth_inputs_rig.py: each factor's zero point sits at the
+# measured p90 (the least-collapsed run) and its width at the p90..p10 span, so
+# the ramp runs 0 -> 1 across the range real runs actually occupy.
+#
+# Why the original thresholds fail (measured ranges in brackets):
+#   trend_resid      needs < -3.2   [-0.756 .. -0.530]   a 25x tail-slope
+#                                                         collapse where runs
+#                                                         deliver ~1.75x
+#   conv_ratio       needs <  0.03  [ 0.066 ..  0.123]   asks 33x, sees 8-15x
+#   late_curv_ratio  needs <  0.3   [ 0.478 ..  0.680]   asks 3.3x, sees 1.5-2x
+#   med_err          needs <  0.003 [0.0006 .. 0.0010]   passes 9/9 -- left
+#                                                         alone, and its ramp
+#                                                         re-anchored only so
+#                                                         the three factors
+#                                                         share one rule
+_OSM_RA_TREND_ZERO = -0.5299
+_OSM_RA_TREND_W = 0.1531
+_OSM_RA_CONV_ZERO = 0.12288
+_OSM_RA_CONV_W = 0.03508
+_OSM_RA_CURV_ZERO = 0.6795
+_OSM_RA_CURV_W = 0.1317
+_OSM_RA_ERR_ZERO = 0.000860
+_OSM_RA_ERR_W = 0.000262
+
+
+# A probe profile's `curv_curve` carries m-2 entries (m = probe grid points,
+# verified on 315 saved profiles), so m >= 5 is what yields the >= 3 curvature
+# points the dwell recommender requires.  nodes.py:382 states the same invariant
+# in its own words: "(>= 3 curvature points; guaranteed at probe_steps >= 5)".
+# Kept here so this guard and that comment cannot drift apart.
+_PROBE_MIN_USABLE_STEPS = 5
+
+
+def _profile_serves_model_probe(prof):
+    """Can this profile serve the model-probe consumers that need curvature?
+
+    Adoption is deliberately NOT gated on this: aflops.py:477-483 documents that
+    the model-probe fallback may legitimately serve a per-prompt COND profile,
+    because every profile carries the whitepoint and the adaptive-noise prior
+    wants it either way.  Only the decision to SKIP our own model probe depends
+    on it -- and that skip is what starved the curvature consumers: a profile
+    produced at cond_probe_steps (default 4) carries `curv_curve` of length 2
+    while the dwell recommender needs >= 3, so the engine skipped its own probe
+    (K = max(4, probe_steps) >= 5) and never produced a usable one.  Measured:
+    70 of 70 saved runs adopted m=4 and never armed the dwell.
+
+    See NOTES.md (round 16 root cause, round 17 fix correction) and
+    scratch_latest_profile_rig.py, whose case C covers exactly this design.
+    """
+    if not isinstance(prof, dict):
+        return False
+    try:
+        m = int(prof.get("n_probe_steps") or 0)
+    except (TypeError, ValueError):
+        return False
+    if m < _PROBE_MIN_USABLE_STEPS:
+        return False
+    # AND the profile must not be DEGENERATE.  This was the hole a live run fell
+    # through: an m=7 profile with med_jump 2.2e-08 satisfies the step count, so
+    # the engine adopted it and SKIPPED its own probe, which flipped the blend to
+    # cond-only (w=1.00, ov 0.432 against 0.277) and produced a visibly
+    # different image -- log_00068 of the 68-73 A/B set.  A profile whose own
+    # dynamics read ~0 cannot serve the curvature consumers, and adopting one is
+    # not "safe", it is SILENT.
+    # Missing fields count as degenerate, because _probe_degenerate defaults both
+    # thresholds to 0.0 -- so an unrecognised profile is re-probed rather than
+    # trusted, which is the safe direction.
+    if _probe_degenerate(prof):
+        return False
+    return True
+
+
 def _latest_profile(model):
     try:
         mk = _model_cache_key(model)
@@ -839,6 +1274,200 @@ def _mid_x0(pts, u_mid, order):
         out = out + p[1] * w
     return out, max(abs(w) for w in ws)
 _ORD_BIG = 1e30
+
+
+# ---------------------------------------------------------------------------
+# THE EXTRAPOLATION-ORDER GATE (`wmax_bound`).
+#
+# The engine rejects an order when its largest Lagrange weight exceeds a scalar cap.  That
+# cap is a PROXY for the quantity that actually matters -- the extrapolation's truncation
+# error, whose exact size is the Lagrange remainder
+#
+#     |err_k(u_t)| = |f^(k)(xi)| / k! * prod_j |u_t - u_j|
+#
+# and the scalar form the cap came from is only its UNIFORM case: on a uniform grid with
+# u_t half a step past the last node, prod_j |u_t - u_j| / k! == c_k * h^k, verified to
+# 1.55e-15 in scratch_extrap_remainder_rig.py -- which also verified that `_mid_x0` IS the
+# exact interpolating polynomial (0.0 relative deviation against an independently computed
+# Lagrange basis).  One scalar cannot describe a real schedule: the consecutive
+# |d log sigma| gaps of the operator's own runs span 28x-76x, so no single h is the gap of
+# any particular step.  `_extrap_geom` reads the factor off the ACTUAL nodes instead --
+# the same equation without the uniformity assumption, and it is free, because the gate
+# already holds the nodes.  Measured on the corpus' own dk_scale/rtol/grids: the shipped
+# scalar form admits an order at 0/39 (anima) and 0/15 (krea) extrapolating steps -- i.e.
+# it refuses everything and the arm is inert -- while this form admits at 36/39 and 11/15,
+# refusing exactly where the grid stretches (du >= 0.25 / >= 0.19).
+#
+# COMPOSITION, NOT REPLACEMENT.  The arm is `weight test AND remainder test`, so it can
+# only ever be TIGHTER than the shipped one: it refuses where the truncation error at THIS
+# step's own geometry exceeds the tolerance, and leaves every other decision where it was.
+# An order whose derivative scale was not measured (`dk_scale` omits any k that needs more
+# samples than the probe grid has) falls back to the weight test alone: we certify, we do
+# not assume.
+#
+# THE RESIDUAL ASSUMPTION, stated where it is consumed: `dk_scale` is measured on the
+# PROBE grid and is a trajectory statistic, so it is not a per-step upper bound -- on an
+# analytic ground truth the shipping median under-bounds 58 of 204 (step, order) cases,
+# by up to 578-1807x at individual steps.  `wmax_budget` is where that residual, and the
+# operator's own judgement, enters.  It scales ONLY this gate's tolerance and never
+# `rtol`, which the corrector also consumes -- scaling that would put two decisions
+# behind one widget.
+#
+# Rig: scratch_extrap_remainder_rig.py (15/15), output committed alongside it.
+# ---------------------------------------------------------------------------
+_ORDER_GATE_AB = {"off": 0, "on": 0, "pass": 0, "refuse": 0, "unmeasured": 0,
+                  "fallback": 0}
+
+
+def _extrap_geom(us, u_t):
+    """prod_j |u_t - u_j| / k! -- the geometric factor of the Lagrange remainder.
+
+    Identical to c_k * h^k on a uniform grid with u_t half a step past the last node
+    (rig check 1c), so using it is not a change of equation, it is the same equation
+    without the uniformity assumption.
+    """
+    n = len(us)
+    if n < 2:
+        return 0.0
+    p = 1.0
+    for u in us:
+        p *= abs(float(u_t) - float(u))
+    return p / float(math.factorial(n))
+
+
+def _order_gate(pts, u_mid, order, wmax, limit, cfg):
+    """(admitted, info) for one candidate order.  `info` is None on the shipped path.
+
+    Shipped path (the arm OFF, or this order's scale unmeasured): the weight test alone,
+    byte-identical to the code before this gate existed.  Arm ON: the weight test AND
+    `(1 - exp(-du)) * geom * dk[k] <= rtol * wmax_budget`, where `du` is recovered from
+    the midpoint every call site passes (`2*|u_mid - u_last|`).
+    """
+    if not bool(cfg.get("wmax_bound", False)):
+        _ORDER_GATE_AB["off"] += 1
+        return (float(wmax) <= float(limit)), None
+    try:
+        sel = pts[-min(int(order), len(pts)):]
+        us = [p[0] for p in sel]
+        dk = cfg.get("_dk_scale")
+        tol = cfg.get("rtol")
+        k = int(order)
+        dscale = None
+        if isinstance(dk, dict):
+            dscale = dk.get(k, dk.get(str(k)))
+        if dscale is None or tol is None:
+            _ORDER_GATE_AB["unmeasured"] += 1
+            return (float(wmax) <= float(limit)), None
+        budget = float(cfg.get("wmax_budget", 1.0) or 1.0)
+        tol_eff = float(tol) * max(budget, 1e-6)
+        du = 2.0 * abs(float(u_mid) - float(us[-1]))
+        prop = 1.0 - math.exp(-max(du, 0.0))
+        bound = _extrap_geom(us, u_mid) * float(dscale)
+        step_err = prop * bound
+        ok = (float(wmax) <= float(limit)) and (step_err <= tol_eff)
+        _ORDER_GATE_AB["on"] += 1
+        _ORDER_GATE_AB["pass" if ok else "refuse"] += 1
+        return bool(ok), {"k": k, "geom": _extrap_geom(us, u_mid), "du": du,
+                          "prop": prop, "dk": float(dscale), "bound": bound,
+                          "step_err": step_err, "tol_eff": tol_eff,
+                          "wmax": float(wmax), "limit": float(limit),
+                          "bound_ok": bool(step_err <= tol_eff),
+                          "weight_ok": bool(float(wmax) <= float(limit))}
+    except Exception:
+        _ORDER_GATE_AB["fallback"] += 1
+        return (float(wmax) <= float(limit)), None
+
+# The series/exp branch switch in `_aflops_step`.  The shipped value is the
+# hand-set 1e-4; the DERIVED value is sqrt(12*eps) of the working dtype, because
+# the truncated Taylor branch's dominant relative error is its phi2 term,
+# (z^2/24)/(1/2) = z^2/12, so the switch belongs where that meets the precision.
+# scratch_step_constants_rig.py verified the z^2/12 law numerically (law/series
+# ratio 0.997..1.001 over z = 1e-5..1e-2) and gives 1.196e-3 for float32 and
+# 5.162e-8 for float64.  1e-4 is 12x conservative for f32, 1937x too large for f64.
+_AFLOPS_SERIES_SWITCH = 1e-4
+
+
+def _derived_series_switch(dtype):
+    """sqrt(12*eps) for the working dtype -- the derived form of the switch."""
+    try:
+        if dtype is not None and getattr(dtype, "is_floating_point", False):
+            eps = float(torch.finfo(dtype).eps)
+        else:
+            eps = 1.1920929e-07
+    except Exception:
+        eps = 1.1920929e-07
+    return math.sqrt(12.0 * eps)
+
+
+# ---------------------------------------------------------------------------
+# A/B REACHABILITY INSTRUMENTATION.
+#
+# WHY THIS EXISTS.  The derived_ab bundle shipped as a NO-OP on every probed run
+# and nobody noticed for two rounds of A/B: five model pairs came back with ZERO
+# differing per-step fields.  The cause was that one of its three sites was gated
+# on a condition that never held (`tol == ENGINE_DEFAULTS["rtol"]`, while every
+# probed run derived a different rtol), and the other two are guarded by
+# `eff >= 2` / a |z| band that real runs frequently never enter.  A flag that is
+# wired to nothing looks EXACTLY like a flag whose effect is below the noise
+# floor -- and the corpus cannot tell those apart.
+#
+# So every A/B site now counts its own invocations and the runs that matter.
+# `ab_reach` is stamped into `_LAST_CFG` and therefore into every saved log, so a
+# log states outright which A/B paths fired instead of leaving it to be inferred.
+# A rig (scratch_ab_reach_rig.py) asserts each site is REACHABLE, i.e. that some
+# configuration actually fires it; a site that can never fire is reported rather
+# than believed to work.
+#
+# Cost: one dict lookup + increment per site per step.  Negligible against a
+# model call, and it is the difference between "no effect" and "not connected".
+# ---------------------------------------------------------------------------
+_AB_REACH = {}
+
+
+def _ab_hit(name, val=None):
+    """Count one A/B site invocation.  `val` keeps the last value seen."""
+    r = _AB_REACH.get(name)
+    if r is None:
+        _AB_REACH[name] = r = [0, None]
+    r[0] += 1
+    if val is not None:
+        r[1] = val
+
+
+def _ab_hit_max(name, val):
+    """Count an invocation and keep the running MAXIMUM instead of the last value.
+
+    Needed for guard-style sites, where "did it ever trip" is the question and
+    the last step's value says nothing: the envelope guard compares a ratio
+    against a bound, so the informative record is the largest ratio seen.
+    """
+    r = _AB_REACH.get(name)
+    if r is None:
+        _AB_REACH[name] = r = [0, val]
+    r[0] += 1
+    try:
+        if r[1] is None or float(val) > float(r[1]):
+            r[1] = val
+    except (TypeError, ValueError):
+        r[1] = val
+
+
+def _ab_reach_reset():
+    _AB_REACH.clear()
+
+
+def _ab_reach_snapshot():
+    """{name: [hits, last_value]} with `hits` first -- cheap, JSON-safe."""
+    return {k: [int(v[0]), v[1]] for k, v in sorted(_AB_REACH.items())}
+
+
+def _ab_reach_report():
+    """Human-readable one-liner per fired site, for logs and rig output."""
+    out = []
+    for k, v in sorted(_AB_REACH.items()):
+        last = "" if v[1] is None else " last={}".format(v[1])
+        out.append("{}={}{}".format(k, v[0], last))
+    return "; ".join(out) or "(no A/B site fired)"
 _AFLOPS_LAM_MIN = -3.0
 _AFLOPS_LAM_MAX = 0.0
 _AFLOPS_X0M_ENV = 1.3
@@ -871,6 +1500,94 @@ def _pixel_innovations(hist_pts, u_t, x0_cur, p_max):
         out.append((pred - x0_cur.float()).pow(2).mean(dim=1, keepdim=True)
                    .sqrt())
     return out
+
+def _pixel_order_bound(pts, u_mid, du, allowed, tol_eff, kmax_cap=8):
+    """Per-pixel HIGHEST VALID order, from the Lagrange remainder -- the RUNGE criterion.
+
+    WHY THIS EXISTS.  The shipped ladder picks the order that best PREDICTS x0
+    (`_pixel_innovations`' argmin).  That answers a different question from the one the order
+    exists for: it is dominated by pixel-level noise, which the higher orders AMPLIFY (their
+    Lagrange weights run 1.5, 1.875, 2.19, 3.28, 5.41 for orders 2-6), so on a real model it
+    settles near order 1 -- measured on the operator's own run, `ord_want` 1.03-1.23 with
+    `|ord_want - ord_mean| <= 5e-4`, i.e. nothing downstream clamps and no cap, budget or gate
+    can move it.  The question that matters is VALIDITY: for THIS pixel, how high can the
+    order go before the polynomial extrapolation stops describing the trajectory and starts
+    oscillating (Runge)?  That is exactly the Lagrange remainder
+
+        |err_k| <= ( prod_j |u_t - u_j| / k! ) * |d^k x0/du^k| / |x0|
+
+    and every factor is measurable from data already in hand: `prod` from the nodes, and
+    `|d^k x0/du^k|` from the k-th difference over this pixel's OWN history -- the engine keeps
+    up to `hist_cap` samples, so k <= 6 on a 16-step run and higher on a 40-step one.  No
+    extra NFE.
+
+    WHY PER-PIXEL IS THE POINT: a pixel with a kink or per-pixel junk blows up its own k-th
+    difference and its bound fails at low k, so it keeps order 1; a pixel on a smooth curve
+    keeps a small difference and is admitted at high k.  The order map is therefore spatially
+    varying by construction, which is what "some parts need order 6, others need order 1
+    because of Runge" means as a measurement.
+
+    `allowed` is the step's own admission list (weights + the remainder gate when it is on):
+    orders this step refuses for everyone are refused here too, so this criterion composes
+    with the safety path rather than bypassing it.
+
+    Returns (order_tensor or None, info).  The tensor is per-pixel, in [1, kmax].
+    """
+    try:
+        n = len(pts)
+        if n < 3:
+            return None, {"reason": "fewer than 3 samples: no second difference"}
+        x0_cur = pts[-1][1].float()
+        ref = x0_cur.pow(2).mean(dim=1, keepdim=True).sqrt().clamp_min(1e-8)
+        prop = 1.0 - math.exp(-max(float(du), 0.0))
+        if not (prop > 0.0):
+            return None, {"reason": "step factor (1 - exp(-du)) is not positive"}
+        # `tol` bounds the STEP error; the remainder bounds the x0 error that feeds it
+        tol_x0 = float(tol_eff) / prop
+        us = [float(p[0]) for p in pts]
+        _h1 = abs(us[-1] - us[-2])
+        # the per-pixel first-difference rate, for the de-bias (see _measure_dk_scale)
+        r1 = ((pts[-1][1].float() - pts[-2][1].float())
+              .pow(2).mean(dim=1, keepdim=True).sqrt()
+              / max(_h1, 1e-12) / ref)
+        kmax = int(max(2, min(int(kmax_cap), n - 1, len(allowed) + 1)))
+        order = torch.ones_like(ref)
+        per_k = []
+        for k in range(2, kmax + 1):
+            if (k - 1) < len(allowed) and not allowed[k - 1]:
+                per_k.append([k, None, None, "refused for this step"])
+                continue
+            sel = pts[-(k + 1):]
+            sus = [float(p[0]) for p in sel]
+            h = sum(abs(sus[i + 1] - sus[i]) for i in range(k)) / float(k)
+            if not (h > 0.0):
+                per_k.append([k, None, None, "degenerate spacing"])
+                continue
+            acc = None
+            for j in range(k + 1):
+                term = sel[k - j][1].float() * float(((-1) ** j) * math.comb(k, j))
+                acc = term if acc is None else acc + term
+            dk = acc.pow(2).mean(dim=1, keepdim=True).sqrt() / (h ** k) / ref
+            # DE-BIAS as in _measure_dk_scale: for x0 = e^{cu} a raw k-th difference over h is
+            # low by rho(ch)^k.  Without it the bound is conservative by that factor.
+            ch = r1 * h
+            rho = torch.where(ch > 1e-9,
+                              (1.0 - torch.exp(-ch)) / ch.clamp_min(1e-9),
+                              torch.ones_like(ch))
+            scale = dk / rho.pow(k)
+            geom = 1.0
+            for p in pts[-k:]:
+                geom *= abs(float(u_mid) - float(p[0]))
+            geom /= float(math.factorial(k))
+            bound = geom * scale
+            ok = bound <= tol_x0
+            order = torch.where(ok, torch.full_like(order, float(k)), order)
+            per_k.append([k, round(float(bound.mean()), 8),
+                          round(float(ok.float().mean()), 4), None])
+        return order, {"kmax": kmax, "n": n, "tol_x0": round(tol_x0, 8), "per_k": per_k}
+    except Exception as e:
+        return None, {"reason": "exception: {}".format(e)}
+
 
 def _grad_weighted_norm(diff, x0, strength=5.0):
     gx = (x0[..., 1:, :] - x0[..., :-1, :]).abs().mean(dim=1, keepdim=True)
@@ -1134,6 +1851,34 @@ def _gaussian_blur_separable(g, win):
     g4 = F.conv2d(g4, ky)
     return g4.reshape(sh)
 
+def _spatial_stats(t):
+    """(rms, std, grad, hf) of a latent -- cheap per-step logging statistics.
+
+    `hf` is the DoG high-pass energy, reusing the engine's own perceptual
+    helper.  Every term is a reduction over a tensor that already exists: no
+    model call and no extra sampling work, so this is orders of magnitude
+    cheaper than one NFE and can stay on permanently.
+
+    Recorded because scalar error metrics (err/tol) demonstrably do NOT
+    discriminate between clamp settings that look very different -- detail
+    energy is a candidate for a signal that does.
+    """
+    f = t.float()
+    rms = float(f.pow(2).mean().sqrt())
+    try:
+        std = float(f.reshape(f.shape[0], -1).std(dim=1).mean())
+    except Exception:
+        std = 0.0
+    grad = float((f[..., 1:, :] - f[..., :-1, :]).abs().mean()
+                 + (f[..., :, 1:] - f[..., :, :-1]).abs().mean())
+    try:
+        hf = float((_gaussian_blur_separable(f, 3)
+                    - _gaussian_blur_separable(f, 5)).pow(2).mean().sqrt())
+    except Exception:
+        hf = 0.0
+    return rms, std, grad, hf
+
+
 def _local_mean(g, win):
     return _gaussian_blur_separable(g, win)
 
@@ -1249,10 +1994,313 @@ def _lf_block_delta_bands(jmap, block=4):
     tot = (e_hi + e_mid + e_lo).clamp_min(1e-20)
     return e_lo / tot, tot
 
+def _endgame_eg_err(endgame):
+    """The endgame error scalar, from the endgame dict directly.
+
+    `_prof_eg` reads exactly this out of a finished profile; it is hoisted here
+    (and `_prof_eg` now delegates) so the PROBE can compute the same number while
+    the profile is still being assembled -- the coverage curve needs `eg_n`, and
+    `eg_n` needs this.  One implementation, two callers, for the same reason the
+    rescue measurement was unified.
+    """
+    if not isinstance(endgame, dict):
+        return None
+    vals = []
+    for lv in (endgame.get("levels") or []):
+        for key in ("rec_q", "rec2_q", "rec_p50"):
+            try:
+                v = lv.get(key)
+                if isinstance(v, (list, tuple)):
+                    vals.append(float(v[1]))
+                else:
+                    vals.append(float(v))
+            except (TypeError, ValueError, IndexError, KeyError):
+                pass
+    return max(vals) if vals else None
+
+
+def _eg_n_from_err(eg_err):
+    """`eg_n`, the same map the gains use (aflops.py:2361), so a probe-side
+    quantity and its run-side consumer cannot disagree."""
+    if eg_err is None:
+        return 0.0
+    try:
+        return 1.0 - math.exp(-float(eg_err) / 0.06)
+    except Exception:
+        return 0.0
+
+
+def _lf_rescue_cov_meta(x0s_ref, eg_err):
+    """Self-describing provenance for `cov_curve`, so a later reader knows which
+    block size, latent size and `eg_n` produced it -- without which the curve is
+    another number of unknown provenance."""
+    try:
+        lat = [int(x0s_ref.shape[-2]), int(x0s_ref.shape[-1])]
+        blk = _lf_block_for(x0s_ref)
+    except Exception:
+        lat, blk = None, None
+    return {"blk": blk, "latent": lat,
+            "eg_n": round(_eg_n_from_err(eg_err), 4),
+            # The run computes floor_mag = rescue_floor * rescue_s and the engine
+            # sets rescue["s"] = 0.0 unconditionally, so this term is identically
+            # 0.0 and the `tot_blk.sqrt() > floor_mag` sub-gate is ALWAYS TRUE.
+            # Recorded rather than assumed, so the coupling is visible.
+            "floor_mag": 0.0,
+            "src": "probe; aflops._lf_rescue_measure (shared with the run)"}
+
+
 def _lf_rescue_window(kn, start=0.55, full=0.72):
     t_in = _sstep((float(kn) - float(start)) / max(float(full) - float(start), 1e-6))
     t_out = 1.0 - 0.5 * _sstep((float(kn) - 0.92) / 0.08)
     return t_in * t_out
+
+
+def _lf_block_for(jmap, ref=32):
+    """The rescue block size as a FRACTION of the latent, not a pixel count.
+
+    WHY THIS IS DERIVED RATHER THAN CONSTANT.  `rescue.block` was a hardcoded 4
+    PIXELS, so under one name it measured three different things depending on the
+    latent: 4/48 of the image at the model probe, 4/16 at the cond probe, 4/128 in
+    a 1024px run.  A block statistic computed at one of those cannot predict the
+    same statistic at another, which is what blocked using the probe to see this
+    pitfall coming.  Measured consequence elsewhere: the rescue's coverage gate
+    sits at a CLIFF (`g_cov`, aflops.py:1724) and a checkpoint swap moved `frac`
+    across it, turning a whole mechanism on and off (see NOTES.md).
+
+    THE ANCHOR IS NOT ARBITRARY.  Keeping the number of blocks per side constant
+    at 32 reproduces block = 4 EXACTLY at 128x128, the resolution the original
+    constant was tuned at, so the operator's existing runs are bit-identical.  The
+    rule only changes what happens at OTHER resolutions, which is the bug.
+
+    Clamped to [2, 8]: below 2 a block stops averaging anything, above 8 the
+    statistic goes blind to the fine structure the rescue is meant to catch.
+    """
+    try:
+        m = min(int(jmap.shape[-2]), int(jmap.shape[-1]))
+    except Exception:
+        return 4
+    return max(2, min(8, int(round(m / float(max(int(ref), 1))))))
+
+
+def _lf_rescue_measure(jmap, d, blk, eg_n, floor_mag, ref_prev=None, diag=None,
+                       ref_drop=0.2231):
+    """The rescue gate's block statistics -- ONE implementation, two callers.
+
+    Hoisted verbatim out of `_lf_step_field` so the RUN-side field and the
+    PROBE-side prediction cannot drift apart.  This project already paid for that
+    lesson once: `oversmooth` had a stored-vs-recomputed path split whose two
+    consumers disagreed for months (DEAD_FEATURES.md section 3).  There is exactly
+    one copy here, and `scratch_rescue_covcurve_rig.py` asserts it reproduces the
+    original inline formula BIT-EXACTLY at three resolutions and two parameter
+    settings -- a near-miss is a failure, not a rounding note.
+
+    `ref_prev` carries the running reference across steps; pass None on the first.
+    `ref_drop` is the reference's decay allowance for THIS step.  The default is
+    the shipped per-step constant, so the run path is bit-identical; the probe
+    additionally computes a variant with k*du (see `_lf_rescue_cov_curve`) by
+    passing that value here.  One implementation, one parameter -- a second copy
+    of the formula would recreate the stored-vs-recomputed split.
+    `diag`, when a dict is passed, is filled with the pass fraction of EACH
+    conjunct plus the median block log-jump.  The gate is a 4-way AND; on the
+    HEALTHY probes the sole binding conjunct is t_ref at 0.0017-0.0035 pass, so
+    the per-term split is what makes that locatable.
+
+    Returns (hit, frac, ref_new, lf_share).
+    """
+    lf_share, tot_blk = _lf_block_delta_bands(jmap, blk)
+    blk_log, _ = _lf_block_scale(jmap, blk)
+    d_blk = F.avg_pool2d(d.reshape(-1, 1, *d.shape[-2:]), blk)
+    n_bt = blk_log.shape[0]
+    ref_tot = torch.quantile(tot_blk.reshape(n_bt, -1).float(), 0.10,
+                             dim=1).view(-1, 1, 1, 1)
+    ref = ref_prev
+    if ref is None or ref.shape != blk_log.shape:
+        ref = blk_log.clone()
+    else:
+        ref = torch.maximum(blk_log, ref - float(ref_drop))
+    t_mag = tot_blk > 1.5 * ref_tot
+    t_flr = tot_blk.sqrt() > floor_mag
+    t_ref = (blk_log - ref) > -0.6931   # >= half the late peak
+    t_dtl = d_blk > (0.1 * (1.0 + 0.7 * eg_n))
+    hit = t_mag & t_flr & t_ref & t_dtl
+    frac = hit.float().mean(dim=(2, 3), keepdim=True)
+    if isinstance(diag, dict):
+        try:
+            # TENSORS, never floats, and cheap means/medians only.  `float(tensor)`
+            # forces a GPU->CPU sync and `.quantile()` SORTs the whole block map;
+            # measured, that made the probe curve 4x more expensive
+            # (scratch_probe_cost_rig.py).  The caller converts once.
+            diag["t_mag"] = t_mag.float().mean()
+            diag["t_floor"] = t_flr.float().mean()
+            diag["t_ref"] = t_ref.float().mean()
+            diag["t_detail"] = t_dtl.float().mean()
+            diag["d_blk_mean"] = d_blk.float().mean()
+            diag["blk_log_med"] = blk_log.median()
+        except Exception:
+            pass
+    return hit, frac, ref, lf_share
+
+
+def _lf_rescue_cov_curve(xs, x0s, grid, eg_n, floor_mag, ref=32):
+    """Per-step rescue coverage along a PROBE trajectory.
+
+    The probe is the only instrument that measures the model AND the prompt
+    BEFORE the run, so it is where a pitfall like the coverage cliff has to be
+    seen coming.  The inputs are already there: `jpx` in `_run_probe`
+    (aflops.py:2972) is the SAME formula as the run's `jmap`, and `d` is
+    `(x - x0)/sigma`, which the probe also holds.
+
+    Indexing follows the run: step i pairs the jump INTO state i with that state's
+    own `d`, i.e. jmap_i = |x0[i+1] - x0[i]| and d_i = (x[i+1] - x0[i+1])/s[i+1].
+
+    Returns a dict:
+      "curve"      per-step `frac` under the SHIPPED per-step decay (0.2231/step)
+      "curve_kdu"  the same under `ref_drop = k*du`, the DERIVED form, or None
+      "terms"      per-conjunct medians for "curve"
+      "k"          the trajectory's own measured decay rate, nats per unit
+                   log-sigma, or None if the trajectory does not decay
+      "n_steps"    number of steps the curve covers
+
+    WHY TWO CURVES.  Measured on the real corpus, the healthy probe's sole binding
+    conjunct is `t_ref` (0.0017-0.0035 pass) while `t_mag` passes 0.71-0.78 and
+    `t_detail` 0.44 -- and t_ref's allowance is a PER-STEP constant of 0.2231 while
+    the probe's own median block-jump decays ~0.5 nats per step.  The jump map
+    falls like sigma^p, so the allowance should be a RATE per unit log-sigma:
+    k*du.  Two independent estimates of k agree at ~2 (the run's mean du is 0.117,
+    and 0.2231/0.117 = 1.9; the probe's measured total decay is ~4 nats over
+    sum(du) = 1.75, giving 2.3) -- i.e. the shipped constant was k*du_run all
+    along, correct only at that one step count.
+
+    That derivation could NOT be validated on synthetic fields:
+    scratch_ref_decay_rig.py tried two and refuted both -- NonlinearFlow passes
+    t_ref 100% at every spacing with a NEGATIVE k (its jump map grows), and
+    PowerFlow(p=2) gives k ~ 0 with hit ~ 0.03.  Neither reproduces the real
+    models' combination of hit 0.27-0.43 AND a decaying median block-jump, because
+    the phenomenon depends on the model's actual spatial prediction structure.
+    So the engine now emits BOTH curves and the next real runs decide.
+    """
+    try:
+        n = min(len(xs), len(x0s), len(grid))
+        if n < 3:
+            return None
+        # Accumulate the per-step fractions ON DEVICE and convert once at the
+        # end.  `float(tensor)` forces a GPU->CPU sync and the timings in
+        # scratch_probe_cost_rig.py are flat across resolutions, i.e. dominated by
+        # per-step sync/launch overhead rather than by tensor size.
+        steps = []
+        fr = []
+        term_rows = []
+        _TKEYS = ("t_mag", "t_floor", "t_ref", "t_detail", "d_blk_mean")
+        med_seq = []
+        du_seq = []
+        u_seq = []          # the SAMPLE positions u = log(sigma), for the k span
+        ref_prev = None
+        for i in range(n - 1):
+            x0a, x0b = x0s[i].float(), x0s[i + 1].float()
+            jmap = (x0b - x0a).pow(2).mean(dim=1, keepdim=True).sqrt()
+            s = float(grid[i + 1])
+            if s <= 1e-8:
+                continue
+            dd = (xs[i + 1].float() - x0b) / s
+            blk = _lf_block_for(jmap, ref)
+            if min(int(jmap.shape[-2]), int(jmap.shape[-1])) < blk:
+                continue
+            du = math.log(max(float(grid[i]), 1e-8)) - math.log(max(s, 1e-8))
+            _dg = {}
+            _hit, frac, ref_prev, _sh = _lf_rescue_measure(
+                jmap, dd, blk, float(eg_n or 0.0), float(floor_mag or 0.0),
+                ref_prev=ref_prev, diag=_dg)
+            if _dg:
+                term_rows.append([_dg[k].detach().reshape(()) for k in _TKEYS
+                                  if k in _dg])
+                if "blk_log_med" in _dg:
+                    med_seq.append(_dg["blk_log_med"].detach().reshape(()))
+                    du_seq.append(du)
+                    u_seq.append(math.log(max(s, 1e-8)))
+            fr.append(frac.mean().detach().reshape(()))
+            steps.append((jmap, dd, blk, du))
+        if not fr:
+            return None
+        _curve = [round(float(v), 6) for v in torch.stack(fr).tolist()]
+        # Per-term MEDIANS over the probe's steps, computed once for the whole
+        # curve: one host transfer for every term together, instead of one sync
+        # per step.
+        _terms = None
+        try:
+            if term_rows and all(len(r) == len(_TKEYS) for r in term_rows):
+                _m = torch.stack([torch.stack(r) for r in term_rows]).tolist()
+                _terms = {}
+                for j, k in enumerate(_TKEYS):
+                    col = sorted(row[j] for row in _m)
+                    _terms[k] = round(col[len(col) // 2], 6)
+        except Exception:
+            _terms = None
+
+        # ---- the DERIVED variant: ref_drop = k*du -------------------------
+        # k is the trajectory's OWN median decay in nats per unit log-sigma.
+        # Nothing here is chosen; if the trajectory does not decay, k is None and
+        # no variant is emitted (there is no decay to allow for).
+        _k = None
+        _kdu = None
+        try:
+            # A FROZEN TRAJECTORY MUST NOT YIELD A CONFIDENT k.  Measured: a
+            # frozen profile (jump_curve all zeros, med_local_err_real 0.0)
+            # produced k = 5.457457 from pure float noise, because the median
+            # log-jump still wobbles by a few nats around the log(1e-12) floor and
+            # the span is small.  So k and the k*du curve are emitted only when the
+            # trajectory actually MOVES, tested RELATIVE to its own scale:
+            #   rel = ||x0[i+1] - x0[i]|| / ||x0[i]||
+            # which is the same relative measure `probe_diag.x0_minus_x_rel` already
+            # reports.  A frozen call gives ~1e-8; a healthy one ~0.03-0.9.  The
+            # floor of 1e-5 is two orders above the float32 noise floor (1.2e-7),
+            # i.e. anchored to the arithmetic rather than tuned.
+            _rel = []
+            for _i in range(max(0, len(x0s) - 2)):
+                _a, _b = x0s[_i].float(), x0s[_i + 1].float()
+                _nb = float(_b.norm())
+                if _nb > 1e-8:
+                    _rel.append(float((_b - _a).norm()) / _nb)
+            _rel_med = (sorted(_rel)[len(_rel) // 2] if _rel else 0.0)
+            _moving = _rel_med > 1e-5
+            if not _moving:
+                # Logged ONCE per process: at the measured prevalence (139 of 224
+                # profiles frozen) this would otherwise flood the console.
+                global _FROZEN_PROBE_LOGGED
+                if not _FROZEN_PROBE_LOGGED:
+                    _FROZEN_PROBE_LOGGED = True
+                    logging.warning(
+                        "[A-FloPS-probe] trajectory FROZEN (median "
+                        "||dx0||/||x0|| = %.3g): the model call is returning its "
+                        "input, so no k and no k*du curve. This is a PROBE BUG, "
+                        "not a model property -- see NOTES.md.", _rel_med)
+            if _moving and len(med_seq) >= 2 and len(u_seq) >= 2:
+                _span = u_seq[0] - u_seq[-1]
+                if _span > 1e-9:
+                    _mm = torch.stack(med_seq).tolist()
+                    _kk = (_mm[0] - _mm[-1]) / _span
+                    if _kk > 1e-6:
+                        _k = round(float(_kk), 6)
+        except Exception:
+            _k = None
+        if _k is not None:
+            try:
+                fr2 = []
+                ref2 = None
+                for (jmap, dd, blk, du) in steps:
+                    _h2, fr_i, ref2, _s2 = _lf_rescue_measure(
+                        jmap, dd, blk, float(eg_n or 0.0),
+                        float(floor_mag or 0.0), ref_prev=ref2,
+                        ref_drop=_k * du)
+                    fr2.append(fr_i.mean().detach().reshape(()))
+                if fr2:
+                    _kdu = [round(float(v), 6)
+                            for v in torch.stack(fr2).tolist()]
+            except Exception:
+                _kdu = None
+        return {"curve": _curve, "terms": _terms, "curve_kdu": _kdu,
+                "k": _k, "n_steps": len(_curve)}
+    except Exception:
+        return None
 
 def _lf_band_fractions(jmap):
     sh = jmap.shape
@@ -1398,34 +2446,20 @@ def _lf_step_field(x0, jmap, vol_prev, med_ref, damp, w, w_vol, gains, kn=1.0,
                                      float(rescue["full"])) if _armed else 0.0)
             _st = resc_state if isinstance(resc_state, dict) else None
             if _armed and jmap is not None:
-                _blk = int(rescue.get("block", 4))
-                lf_share, tot_blk = _lf_block_delta_bands(jmap, _blk)
-                blk_log, _ = _lf_block_scale(jmap, _blk)
-                d_blk = F.avg_pool2d(d.reshape(-1, 1, *d.shape[-2:]), _blk)
-                n_bt = blk_log.shape[0]
-                ref_tot = torch.quantile(tot_blk.reshape(n_bt, -1).float(),
-                                         0.10, dim=1).view(-1, 1, 1, 1)
+                # Scale-free block (aflops.py:_lf_block_for).  Equals 4 at
+                # 128x128, i.e. the old hardcoded value, so runs at the
+                # resolution the constant was tuned at are unchanged; every other
+                # resolution now measures the same FRACTION of the image instead
+                # of the same pixel count.
+                _blk = _lf_block_for(jmap)
                 floor_mag = (float(rescue.get("floor", 0.02))
                              * float(rescue.get("s", 0.0) or 0.0))
-                ref = _st.get("ref") if _st else None
-                if ref is None or ref.shape != blk_log.shape:
-                    ref = blk_log.clone()
-                else:
-                    ref = torch.maximum(blk_log, ref - 0.2231)  # log(1.25)
-                # The rescue targets blocks that are still moving and where the
-                # model is predicting real detail (high-frequency x0 content,
-                # the d_blk term).  The old "structure static" gate (lf_share
-                # < 0.5) measured the BAND OF THE x0 CHANGE, which is ~95%
-                # low-frequency for these models (the structure is still
-                # forming late, not static), so it blocked ~99% of blocks and
-                # kept the rescue permanently off.  Drop it: d_blk already
-                # verifies "the model predicts detail", and the still-moving
-                # + coverage gates bound the region.
-                hit = ((tot_blk > 1.5 * ref_tot)
-                       & (tot_blk.sqrt() > floor_mag)
-                       & ((blk_log - ref) > -0.6931)   # >= half the late peak
-                       & (d_blk > (0.1 * (1.0 + 0.7 * eg_n))))
-                frac = hit.float().mean(dim=(1, 2, 3), keepdim=True)
+                # ONE implementation of the gate's block test, shared with the
+                # probe (aflops.py:_lf_rescue_measure).  The probe can therefore
+                # compute the identical statistic before the run.
+                hit, frac, ref, lf_share = _lf_rescue_measure(
+                    jmap, d, _blk, eg_n, floor_mag,
+                    ref_prev=(_st.get("ref") if _st else None))
                 g_cov = ((float(rescue.get("max_cov", 0.35)) - frac)
                          / 0.10).clamp(0.0, 1.0)
                 need = 2.0 if rescue.get("fast") else 3.0
@@ -1804,6 +2838,73 @@ def _probe_degenerate(prof):
     return mj < 1e-4 and mc < 1e-4
 
 
+def _lf_fuse_evidence(sig_m, sig_c, prof_m, prof_c, cond_w):
+    """Fuse the model-probe and per-prompt cond-probe evidence.
+
+    Takes the ALREADY-EXTRACTED sigs (the caller owns `_one`, which depends on
+    three other nested helpers) plus the two profiles, which are needed only for
+    the degeneracy test.  Returns (sig_or_None, w_or_None, provenance_string).
+
+    THE GUARD WAS ONE-SIDED, and measured corpus numbers say which way it should
+    point.  Over 198 logs the freeze rate by probe type is:
+
+        ENGINE-side probe     7 frozen / 297 healthy     2%
+        NODE-side probe     122 frozen /  52 healthy    70%
+        COND probe          275 frozen / 118 healthy    70%
+
+    (`ret_rel`, the pass-through detector, separates them perfectly: every 0.0 is
+    frozen, every non-zero healthy.)  Yet the fusion guarded only the MODEL side --
+    `if _probe_degenerate(prof_m): w = 1.0` -- which hands 100% of the evidence to
+    the cond probe, the one 3x MORE likely to be frozen.  And a frozen cond
+    profile was not rejected anywhere: the selection path checks only the key and
+    `version >= 7`, with no degeneracy test.
+
+    So the guard is now symmetric:
+      * only the model probe is degenerate -> w = 1.0, unchanged, with the same
+        "model+cond(w=1.00)" provenance string, so runs that already took this path
+        are bit-identical;
+      * only the cond probe is degenerate  -> w = 0.0 (NEW: the model probe wins);
+      * BOTH degenerate -> no evidence at all, so the local field stands down
+        rather than averaging two profiles that measured nothing.
+    """
+    _dm = bool(isinstance(prof_m, dict) and _probe_degenerate(prof_m))
+    _dc = bool(isinstance(prof_c, dict) and _probe_degenerate(prof_c))
+    if _dm and _dc:
+        return None, None, "none"
+    if sig_m is not None and sig_c is not None:
+        w = min(max(float(cond_w), 0.0), 1.0)
+        if _dm:
+            w = 1.0
+        elif _dc:
+            w = 0.0
+        sig = {key: (1.0 - w) * sig_m[key] + w * sig_c[key]
+               for key in ("ov", "osm", "err", "spike")}
+        sig["dist"] = sig_m["dist"] or sig_c["dist"]
+        sig["n"] = (1.0 - w) * sig_m["n"] + w * sig_c["n"]
+        eg_m, eg_c = sig_m["eg"], sig_c["eg"]
+        if eg_m is not None and eg_c is not None:
+            sig["eg"] = (1.0 - w) * eg_m + w * eg_c
+        else:
+            sig["eg"] = eg_m if eg_m is not None else eg_c
+        dir_m, dir_c = sig_m["dir"], sig_c["dir"]
+        if dir_m is not None and dir_c is not None:
+            sig["dir"] = (1.0 - w) * dir_m + w * dir_c
+        else:
+            sig["dir"] = dir_m if dir_m is not None else dir_c
+        # The model-degenerate case keeps its EXACT existing string
+        # ("model+cond(w=1.00)"), so runs that already took that path stay
+        # comparable in the corpus.  The cond-degenerate case is new and has no
+        # legacy to preserve, so it says WHY -- a log reader should not have to
+        # remember that w=0.00 means "the cond probe measured nothing".
+        _sfx = " cond-degenerate" if (_dc and not _dm) else ""
+        return sig, w, "model+cond(w=%.2f)%s" % (w, _sfx)
+    if sig_m is not None:
+        return sig_m, None, ("model (cond degenerate)" if _dc else "model")
+    if sig_c is not None:
+        return sig_c, None, ("cond (model degenerate)" if _dm else "cond")
+    return None, None, "none"
+
+
 def _lf_auto_gains(prof_m, prof_c, cond_w, n_steps, sigmas=None, cfg=None):
     def _interp_curve(curve, grid):
         n = len(curve)
@@ -1845,21 +2946,9 @@ def _lf_auto_gains(prof_m, prof_c, cond_w, n_steps, sigmas=None, cfg=None):
         return min(ns) if ns else 0
 
     def _prof_eg(prof):
-        eg = prof.get("endgame")
-        if not isinstance(eg, dict):
-            return None
-        vals = []
-        for lv in (eg.get("levels") or []):
-            for key in ("rec_q", "rec2_q", "rec_p50"):
-                try:
-                    v = lv.get(key)
-                    if isinstance(v, (list, tuple)):
-                        vals.append(float(v[1]))
-                    else:
-                        vals.append(float(v))
-                except (TypeError, ValueError, IndexError, KeyError):
-                    pass
-        return max(vals) if vals else None
+        # Delegates to the module-level extraction so the PROBE can compute the
+        # same scalar before the profile exists (see _endgame_eg_err).
+        return _endgame_eg_err(prof.get("endgame"))
 
     def _prof_dir(prof):
         dc = prof.get("dir_cons_valid") or []
@@ -1902,32 +2991,11 @@ def _lf_auto_gains(prof_m, prof_c, cond_w, n_steps, sigmas=None, cfg=None):
 
     sig_m = _one(prof_m) if isinstance(prof_m, dict) else None
     sig_c = _one(prof_c) if isinstance(prof_c, dict) else None
-    if sig_m is not None and sig_c is not None:
-        w = min(max(float(cond_w), 0.0), 1.0)
-        # Degenerate model probe -> trust the per-prompt probe (see
-        # _probe_degenerate) instead of averaging in ~0 evidence.
-        if _probe_degenerate(prof_m):
-            w = 1.0
-        sig = {key: (1.0 - w) * sig_m[key] + w * sig_c[key]
-               for key in ("ov", "osm", "err", "spike")}
-        sig["dist"] = sig_m["dist"] or sig_c["dist"]
-        sig["n"] = (1.0 - w) * sig_m["n"] + w * sig_c["n"]
-        eg_m, eg_c = sig_m["eg"], sig_c["eg"]
-        if eg_m is not None and eg_c is not None:
-            sig["eg"] = (1.0 - w) * eg_m + w * eg_c
-        else:
-            sig["eg"] = eg_m if eg_m is not None else eg_c
-        dir_m, dir_c = sig_m["dir"], sig_c["dir"]
-        if dir_m is not None and dir_c is not None:
-            sig["dir"] = (1.0 - w) * dir_m + w * dir_c
-        else:
-            sig["dir"] = dir_m if dir_m is not None else dir_c
-        src = "model+cond(w=%.2f)" % w
-    elif sig_m is not None:
-        sig, src = sig_m, "model"
-    elif sig_c is not None:
-        sig, src = sig_c, "cond"
-    else:
+    # The fusion (and its now-SYMMETRIC degeneracy guard) lives in
+    # `_lf_fuse_evidence`, so it can be rigged directly against the frozen
+    # signatures measured in the corpus.  See its docstring for the numbers.
+    sig, _w_used, src = _lf_fuse_evidence(sig_m, sig_c, prof_m, prof_c, cond_w)
+    if sig is None:
         ev = {"source": "none", "ov": 0.0, "osm": 0.0, "err": 0.0,
               "spike": 1.0, "dist": False, "n_steps": int(n_steps)}
         return None, ev
@@ -1961,7 +3029,7 @@ def _lf_auto_gains(prof_m, prof_c, cond_w, n_steps, sigmas=None, cfg=None):
             # signal for probes whose log_gap_probe/log_gap_real > 2.
             a4_bump = 0.15 * _ratio
             ov = min(1.0, ov + a4_bump)
-    ev = max(ov, osm)
+    ev = max(ov, osm) if _EV_AB_MODE == "engine" else ov
     few = min(max((9.0 - float(n_steps)) / 6.0, 0.0), 1.0)
     err_n = 1.0 - math.exp(-err / 0.03)
     # same log mapping as s_ovs_spike: the spike ratio spans orders of
@@ -2059,12 +3127,14 @@ def _compute_consistency(derivative_norm, x0_norm, step_size):
     # -> 1, i.e. "always stable") on flow models with tiny log-sigma steps.
     return 1.0 / (1.0 + float(derivative_norm) / (float(x0_norm) * step))
 
-def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None):
+def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None,
+                 series_switch=None):
+    """Returns (x_new, lam_clamped, lam_raw), or (None, None, None)."""
     if len(hist) < 1:
-        return None, None
+        return None, None, None
     du = math.log(max(float(s), 1e-8)) - math.log(max(float(sn), 1e-8))
     if du <= 0.0:
-        return None, None
+        return None, None, None
     x_prev = hist[-1][3]
     x0_prev = hist[-1][2]
     s_prev_log = hist[-1][0]
@@ -2074,21 +3144,32 @@ def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None):
     delta_x = (x - x_prev).flatten().float()
     dx_norm_sq = float(delta_x.dot(delta_x))
     if dx_norm_sq < 1e-12:
-        return None, None
-    lam = float(delta_v.dot(delta_x) / dx_norm_sq)
+        return None, None, None
+    lam_raw = float(delta_v.dot(delta_x) / dx_norm_sq)
     _lo = _AFLOPS_LAM_MIN if lam_min is None else float(lam_min)
     _hi = _AFLOPS_LAM_MAX if lam_max is None else float(lam_max)
-    lam = max(_lo, min(_hi, lam))
+    lam = max(_lo, min(_hi, lam_raw))
     z = lam * du
     az = abs(z)
     if az > 10.0:
-        return None, None
+        return None, None, None
     h_n = x0 - (1.0 + lam) * x
-    if az < 1e-4:
+    # A/B #1: the series/exp branch switch.  Shipped = the fixed 1e-4; derived =
+    # sqrt(12*eps), the z at which the series' dominant relative error (z^2/12,
+    # verified in scratch_step_constants_rig.py) meets the working precision.
+    _sw = _AFLOPS_SERIES_SWITCH if series_switch is None else float(series_switch)
+    _sw_is_custom = series_switch is not None
+    if _sw_is_custom:
+        _ab_hit("series.custom_switch_calls")
+    if az < _sw:
+        if _sw_is_custom:
+            _ab_hit("series.custom_branch_series")
         exp_z    = 1.0 + z * (1.0 + z * (0.5 + z / 6.0))
         phi1_du  = du * (1.0 + z * (0.5 + z / 6.0))
         phi2_du2 = du * du * (0.5 + z / 6.0)
     else:
+        if _sw_is_custom:
+            _ab_hit("series.custom_branch_exp", round(az, 8))
         exp_z    = math.exp(z)
         em1      = math.expm1(z)
         phi1_du  = em1 / lam
@@ -2101,7 +3182,7 @@ def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None):
         if du_h > 1e-8:
             slope = (h_n - h_prev) / du_h
             x_new = x_new + phi2_du2 * slope
-    return x_new, lam
+    return x_new, lam, lam_raw
 
 # ---------------------------------------------------------------------------
 # Model-internal cache isolation for probe calls
@@ -2120,49 +3201,86 @@ def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None):
 # ---------------------------------------------------------------------------
 _CACHE_OPT_OUT = {"device": "off"}
 _CACHE_ISOLATION_LOGGED = [False]
+_FROZEN_PROBE_LOGGED = False   # one-shot: the frozen-probe warning floods otherwise
+_PROBE_CALL_DIAG = {}          # which model call path the last probe step took
+
+
+# Sampling cfg-function hooks a GRAPH can install through model_options.  Every
+# ComfyUI sampling call returns through cfg_function, and comfy/samplers.py:592-596
+# computes `cfg_result = x - model_options["sampler_cfg_function"](args)`.  A hook that
+# yields zero for probe-shaped input therefore makes the call return EXACTLY its own
+# input -- the frozen probe, bit-exact (ret_rel 0.0, not 1e-8).  Measured over the whole
+# corpus: node 79 frozen / 0 healthy with the hook present and 0/20 without, cond
+# 168/0 vs 0/52, engine healthy either way.  A probe must measure the MODEL, so these
+# come off probe calls.  Rig: scratch_cfg_hook_freeze_rig.py.
+_PROBE_CFG_HOOK_KEYS = ("sampler_cfg_function", "sampler_pre_cfg_function",
+                        "sampler_post_cfg_function", "sampler_calc_cond_batch_function")
+_CFG_HOOK_STRIP_LOGGED = [False]
 
 
 def _probe_model_options(extra_args):
-    """Model options copy with model-internal caches disabled, for probe
-    calls.  Returns None when there is nothing cache-shaped to isolate (the
+    """Model options copy for probe calls: cfg-function hooks removed and
+    model-internal caches disabled.  Returns None when neither applies (the
     caller then keeps using the run's own model_options, zero overhead)."""
     mo = (extra_args or {}).get("model_options")
     if not isinstance(mo, dict):
         return None
+    changed = False
+    mo2 = None
+
+    # ---- the graph's CFG-function hooks OFF (why: see above) --------------
+    try:
+        hook_keys = [k for k in _PROBE_CFG_HOOK_KEYS if k in mo]
+        if hook_keys:
+            mo2 = dict(mo)
+            for k in hook_keys:
+                mo2.pop(k, None)
+            changed = True
+            if not _CFG_HOOK_STRIP_LOGGED[0]:
+                _CFG_HOOK_STRIP_LOGGED[0] = True
+                logging.info("[A-FloPS-probe] sampling cfg-function hook(s) "
+                             "disabled for probe calls (%s): a probe measures "
+                             "THE MODEL, not the graph's CFG wrapper -- "
+                             "comfy/samplers.py:596 returns x - hook(args), so "
+                             "a hook yielding zero makes the probe report its "
+                             "own input", ", ".join(sorted(hook_keys)))
+    except Exception:
+        pass
+
+    # ---- model-internal caches OFF (existing behaviour) -------------------
     try:
         to = mo.get("transformer_options")
-        if not isinstance(to, dict):
-            return None
-        cache_keys = [k for k in to.keys()
-                      if isinstance(k, str) and "cache" in k.lower()]
-        if not cache_keys:
-            return None
-        to2 = dict(to)
-        off_keys = []
-        for k in cache_keys:
-            v = to2.get(k)
-            if isinstance(v, dict):
-                if v.get("device") == "off":
-                    continue
-                v2 = dict(v)
-                v2["device"] = "off"
-                to2[k] = v2
-            else:
-                to2.pop(k, None)
-            off_keys.append(k)
-        if not off_keys:
-            return None
-        mo2 = dict(mo)
-        mo2["transformer_options"] = to2
-        if not _CACHE_ISOLATION_LOGGED[0]:
-            _CACHE_ISOLATION_LOGGED[0] = True
-            logging.info("[A-FloPS-probe] model-internal cache options "
-                         "disabled for probe calls (%s): probe-shaped "
-                         "sequences must never read or fill the model's "
-                         "own caches", ", ".join(sorted(off_keys)))
-        return mo2
+        if isinstance(to, dict):
+            cache_keys = [k for k in to.keys()
+                          if isinstance(k, str) and "cache" in k.lower()]
+            to2 = dict(to)
+            off_keys = []
+            for k in cache_keys:
+                v = to2.get(k)
+                if isinstance(v, dict):
+                    if v.get("device") == "off":
+                        continue
+                    v2 = dict(v)
+                    v2["device"] = "off"
+                    to2[k] = v2
+                else:
+                    to2.pop(k, None)
+                off_keys.append(k)
+            if off_keys:
+                if mo2 is None:
+                    mo2 = dict(mo)
+                mo2["transformer_options"] = to2
+                changed = True
+                if not _CACHE_ISOLATION_LOGGED[0]:
+                    _CACHE_ISOLATION_LOGGED[0] = True
+                    logging.info("[A-FloPS-probe] model-internal cache options "
+                                 "disabled for probe calls (%s): probe-shaped "
+                                 "sequences must never read or fill the model's "
+                                 "own caches", ", ".join(sorted(off_keys)))
     except Exception:
-        return None
+        pass
+
+    return mo2 if changed else None
 
 
 # Instance-level cache isolation: several architectures auto-enable their
@@ -2245,6 +3363,12 @@ def _probe_model_call(model, x, sigma, extra_args):
     whatever the architecture.
     """
     ea = dict(extra_args or {})
+    # Capture the RUN's cfg hooks BEFORE the sanitizer runs: _probe_model_options returns a
+    # copy with them REMOVED, so reading ea["model_options"] further down would always
+    # report empty.  This is the value that says whether the probe needed protecting.
+    _hooks_in_run = sorted(
+        str(_k) for _k in _PROBE_CFG_HOOK_KEYS
+        if isinstance(ea.get("model_options"), dict) and _k in ea["model_options"])
     _mopt = _probe_model_options(ea)
     if _mopt is not None:
         ea["model_options"] = _mopt
@@ -2260,8 +3384,146 @@ def _probe_model_call(model, x, sigma, extra_args):
                      "latent (%s dropped)",
                      "shape %s" % (_shape,) if _shape is not None
                      else type(dropped).__name__)
+    # ---- WHICH CALL PATH ACTUALLY RAN, and with what -----------------------
+    # SOLVED -- see "ROOT CAUSE FOUND" in NOTES.md and scratch_cfg_hook_freeze_rig.py.
+    # The frozen probes were a GRAPH-INSTALLED `sampler_cfg_function`:
+    # comfy/samplers.py:627 returns every sampling call through cfg_function, and
+    # :592-596 computes `cfg_result = x - model_options["sampler_cfg_function"](args)`,
+    # so a hook yielding zero returns EXACTLY the input -- bit-exact, which is why
+    # ret_rel was 0.0 and not 1e-8.  The hooks are now stripped from probe calls by
+    # _probe_model_options, and `cfg_hook_in_run` below records which ones the RUN
+    # carried, so a log says whether this probe was protected.
+    # (The text that stood here before blamed the bare `model(x, sigma)` fallback and
+    # called the freeze INTERMITTENT.  Both were wrong; the freeze tracked the graph.)
+    #
+    # `cfg_hook_in_run` is written BELOW, after the clear() -- writing it here was a bug
+    # that shipped in 55825a1 and showed up as cfg_hook_in_run=None in every log: the
+    # assignment sat one line above `_PROBE_CALL_DIAG.clear()`, which wiped it before the
+    # call that consumes it.  That is precisely the instrumentation trap described in the
+    # sibling comment further down, committed anyway.  Read the order before adding a key.
+    _PROBE_CALL_DIAG.clear()
+    _mo = ea.get("model_options")
+    _mo_keys = sorted(str(_k) for _k in _mo.keys()) if isinstance(_mo, dict) else []
+    _to = _mo.get("transformer_options") if isinstance(_mo, dict) else None
+    _to_keys = (sorted(str(_k) for _k in _to.keys())
+                if isinstance(_to, dict) else [])
+    _PROBE_CALL_DIAG.update({
+        "extra_keys": ",".join(sorted(str(_k) for _k in ea.keys())) or "(none)",
+        "model": type(model).__name__,
+        "has_denoise_mask": bool("denoise_mask" in ea),
+        "model_options": bool(_mo),
+        # ---- CONTENT, not just keys -------------------------------------
+        # The frozen/healthy comparison left NO difference in path or key names:
+        # both report path=primary, the same extra_keys and the same model class
+        # (KSamplerX0Inpaint).  The remaining difference has to be in what those
+        # arguments CARRY, and for a Flux-family model the conditioning rides in
+        # model_options["transformer_options"] -- so record its keys and the size
+        # of the conditioning it holds.  Without this the next round is another
+        # inference instead of a reading.
+        "mo_keys": ",".join(_mo_keys) or "(none)",
+        "to_keys": ",".join(_to_keys) or "(none)",
+        "to_n": (len(_to) if _to is not None else None),
+        # ---- THE CFG HOOKS THE RUN CARRIED ---------------------------------
+        # Written AFTER the clear() above (see the note there), and captured BEFORE
+        # _probe_model_options stripped them (see _hooks_in_run).  Non-empty means the run
+        # installed a sampling cfg hook -- the thing that used to make this probe report
+        # its own input -- and that hook was removed for this call.
+        "cfg_hook_in_run": _hooks_in_run,
+        # ---- THE INPUT ITSELF --------------------------------------------
+        # Reading the two paths end to end turned up exactly two structural
+        # asymmetries, both confined to the node-invoked probes.  BOTH HAVE SINCE
+        # BEEN SETTLED -- kept here so neither is re-derived:
+        #   1. `_engine_cond_probe_run` used to run on `model_patcher.clone()`.
+        #      REMOVED.  The clone shares the SAME model object
+        #      (get_clone_model_override -> self.model, model_patcher.py:428-429;
+        #      is_clone -> `self.model is other.model`, :592-595; and the module
+        #      that actually runs is _prepare_sampling's `real_model = model.model`,
+        #      sampler_helpers.py:202), so it was never a different model.
+        #      MEASURED: every clone-path probe returned its own input for all
+        #      seven non-anima models (node 56 frozen / 0 healthy, cond 114 / 0),
+        #      while the SAME `_run_probe` on the real patcher is healthy for
+        #      every model (engine 0 frozen / 60 healthy).
+        #      The bookkeeping mechanism (patches_uuid copied unchanged at :450)
+        #      is NOT the explanation -- parent and clone share ONE uuid, so it
+        #      computes identically on both paths; rig scratch_uuid_identity_rig.py
+        #      (20/20) settled that.  Mechanism still unknown.
+        #      See NOTES.md, "THE FREEZE IS AN INTERACTION".
+        #   2. the node-side path builds its latent with
+        #      `_probe_latent_shape(ref_x=None, ...)`, i.e. with NO reference
+        #      latent, so the probe is SQUARE.  REFUTED AS THE CAUSE: on the fix
+        #      build the node probe and the engine probe pass the IDENTICAL shape
+        #      [1, 16, 1, 48, 48] at the identical rank, and one is frozen while the
+        #      other is healthy -- so the shape does not decide this.
+        # What is still worth recording is the shape actually passed and the sigma it
+        # was called at: they show what the probe was handed.
+        "x_shape": (tuple(int(v) for v in x.shape) if hasattr(x, "shape")
+                    else None),
+        "sigma0": (round(float(sigma.reshape(-1)[0]), 6)
+                   if hasattr(sigma, "reshape") else None),
+    })
+    # ---- PATCHER / WEIGHT-PATCH IDENTITY -----------------------------------
+    # FROM THE COMFYUI SOURCE, which is the only place this could be settled:
+    #   model_patcher.py:446-454  `clone()` builds a fresh patcher, copies no load
+    #                             state, and sets `n.patches_uuid = self.patches_uuid`
+    #                             -- the clone claims the PARENT's identity.
+    #   model_patcher.py:1107      loading stamps `model.current_weight_patches_uuid
+    #                             = patches_uuid` onto the model instance.
+    #   model_patcher.py:1259      `unpatch_weights = current_weight_patches_uuid is
+    #                             not None and (current_weight_patches_uuid !=
+    #                             patches_uuid or force_patch_weights)`
+    # So a patcher whose uuid MATCHES the stamped one is assumed already applied and
+    # is NOT re-patched.  A clone sharing its parent's uuid can therefore believe its
+    # weights are applied when they are not.
+    #
+    # THE CLONE WAS USED ONLY BY THE NODE-INVOKED PROBES (`_engine_cond_probe_run`) --
+    # exactly the two paths that returned identity -- against the engine-side probe on
+    # the real patcher, which never did.  That clone is now REMOVED (see the block
+    # above).  The three values below are still recorded, because they show whether
+    # the weights were applied at all, which is the thing the clone was getting wrong.
     try:
-        return model(x, sigma, **ea)
+        _pp = _navigate_to_patcher(model)
+        if _pp is not None:
+            _pu = str(getattr(_pp, "patches_uuid", None))
+            _mm_ = getattr(_pp, "model", None)
+            _cu = str(getattr(_mm_, "current_weight_patches_uuid", None))
+            _PROBE_CALL_DIAG["puuid"] = _pu[:8]
+            _PROBE_CALL_DIAG["stamped_uuid"] = _cu[:8]
+            _PROBE_CALL_DIAG["uuid_match"] = bool(_pu == _cu and _pu != "None")
+            try:
+                _PROBE_CALL_DIAG["loaded_mb"] = round(
+                    float(getattr(_pp, "loaded_size", lambda: 0.0)()
+                          or 0.0) / (1024 * 1024), 2)
+            except Exception:
+                _PROBE_CALL_DIAG["loaded_mb"] = None
+            _PROBE_CALL_DIAG["patcher"] = type(_pp).__name__
+    except Exception:
+        pass
+    # ---- PROBE RANK DECISION -----------------------------------------------
+    # x_shape already shows the consequence (4-D vs 5-D).  `shape_src` records
+    # the decision that BUILT this probe's latent -- which call site, whether
+    # ref_x was a tensor and of what rank, and how the rank was resolved -- so
+    # the reason is bound to the latent instead of to whatever ran last.
+    try:
+        if _LAST_SHAPE_DIAG:
+            _PROBE_CALL_DIAG["shape_src"] = dict(_LAST_SHAPE_DIAG)
+        if _PROBE_RANK_DIAG:
+            _PROBE_CALL_DIAG["rank_why"] = dict(_PROBE_RANK_DIAG)
+    except Exception:
+        pass
+    try:
+        _out = model(x, sigma, **ea)
+        _PROBE_CALL_DIAG["path"] = "primary"
+        # Did the model actually DO anything?  A pass-through returns x itself,
+        # so record the relative displacement of the returned x0 from the input.
+        # The frozen probe's ~1e-8 is float rounding on an unchanged trajectory;
+        # a working call is 0.03-1.0.
+        try:
+            _nx = float(x.float().norm())
+            _d = float((_out.float() - x.float()).norm())
+            _PROBE_CALL_DIAG["ret_rel"] = round(_d / max(_nx, 1e-8), 8)
+        except Exception:
+            _PROBE_CALL_DIAG["ret_rel"] = None
+        return _out
     except TypeError as e1:
         msg = str(e1)
         attempts = []
@@ -2269,20 +3531,28 @@ def _probe_model_call(model, x, sigma, extra_args):
             # Required positionally by this revision and absent from
             # extra_args (e.g. the node-side model probe, whose extra_args
             # start empty).
-            attempts.append(lambda: model(x, sigma, None, **ea))
-            attempts.append(lambda: model(x, sigma, None,
-                                          model_options=ea.get(
-                                              "model_options", {}),
-                                          seed=ea.get("seed")))
+            attempts.append(("denoise_pos",
+                             lambda: model(x, sigma, None, **ea)))
+            attempts.append(("denoise_pos_min", lambda: model(
+                x, sigma, None, model_options=ea.get("model_options", {}),
+                seed=ea.get("seed"))))
         if "keyword" in msg:
             # The chain model only accepts the explicit kwargs of this
             # revision; retry with progressively less.
-            attempts.append(lambda: model(x, sigma))
-        for att in attempts:
+            # *** THIS IS THE SUSPECT *** -- `model(x, sigma)` carries NO
+            # conditioning and NO model_options, and the node-side probe is the
+            # documented case that reaches it.  If this path is what a FROZEN run
+            # takes, the fix is to give the node-side probe the guider's real
+            # extra_args rather than to touch any threshold.
+            attempts.append(("BARE_NO_ARGS", lambda: model(x, sigma)))
+        for _pname, att in attempts:
             try:
-                return att()
+                _out = att()
+                _PROBE_CALL_DIAG["path"] = _pname
+                return _out
             except TypeError:
                 continue
+        _PROBE_CALL_DIAG["path"] = "FAILED"
         raise e1
 
 def _probe_noise_survival(model, extra_args, xs, x0s, grid, ones, gen=None):
@@ -2328,6 +3598,320 @@ def _probe_noise_survival(model, extra_args, xs, x0s, grid, ones, gen=None):
     except Exception:
         return 0.15
 
+# ---------------------------------------------------------------------------
+# DERIVED CALIBRATION CONSTANTS -- measured, rigged, and behind A/B TOGGLES.
+#
+# Two derived values were effectively CONSTANTS on real runs, for two unrelated reasons, and
+# both are now derivable rather than hand-set.  Each has its own toggle so behaviour can be
+# compared on one run, and BOTH the shipped and the derived value are logged every time
+# regardless of the toggle, so a single run shows the whole delta.
+#
+# 1. THE PERCENTILE ESTIMATOR.  Both `_pct` bodies used `index = int(p*n)`, which for n = 2
+#    gives int(0.5*2) == int(0.9*2) == 1 -- so `guard_sig_p90` IS `guard_sig_med`, r = 1.0 by
+#    construction, and `guard_floor = 0.075*sqrt(r)` collapsed to its r = 1 value.  The cond
+#    probe collects m-1 guard signals and Krea runs n_probe_steps = 3 (vs anima's 8), which
+#    is exactly the observed split.  The estimator is ALSO biased at every n: at n = 10 it
+#    returns the MAXIMUM for p = 0.9 and the 60th percentile for p = 0.5.  The corrected form
+#    interpolates at position (n-1)*p.  Rig: scratch_percentile_collision_rig.py (12/12),
+#    including the corpus prediction n_guard <= 2 <=> p90 == med with 0 violations.
+#
+# 2. THE WMAX CAP.  `wmax_base` is not a gain: `_mid_x0` returns `max(abs(w) for w in ws)`,
+#    the largest LAGRANGE weight of the extrapolation to the interval midpoint, and the order
+#    is REJECTED when that exceeds the cap.  Those weights are purely geometric (invariant to
+#    shift+scale of the u axis) and, on a uniform grid extrapolating half a step, depend on
+#    the ORDER ALONE: 1.5, 1.875, 2.1875, 3.28125, 5.41406 for orders 2..6.  So a cap of 2.5
+#    is an ORDER SELECTOR -- admit <= 4, reject >= 5 -- chosen without ever reading the grid
+#    spacing h, while the error bound carries h^k.  The derived cap reads h and the tolerance:
+#
+#        |err_k| <= geom_k / k! * |d^k x0/du^k|,   geom_k = (2k-1)!! / 2^k * h^k
+#        =>  allow order k  iff  c_k * h^k * med_curv <= tol,  c_k = (2k-1)!! / (2^k * k!)
+#
+#    `med_curv` IS the measured derivative scale, not a proxy: the builders compute it as a
+#    central second difference of x0 in u normalised by |x0| (aflops.py:3821-3823), i.e.
+#    exactly |d^2 x0/du^2| / |x0|.  `h` is the measured mean log gap.  Both were verified
+#    against an analytic non-degenerate ground truth: scratch_lagrange_geometric_rig.py
+#    (6/6), including the closed form geom_k = h^k * (2k-1)!! / 2^k to 1.12e-15.
+#
+#    NOTE the c_k form uses the same derivative scale for every k -- an explicit smoothness
+#    assumption, and a CONSERVATIVE one for k > 2 (higher derivatives of a smooth x0 decay).
+#    It is stated here rather than buried: the bound is verified for whichever k is selected.
+# ---------------------------------------------------------------------------
+_CALIB_FLAGS_KEY = "calib_flags"
+_CALIB_AB = {"pct_derived": 0, "pct_shipped": 0,
+             "wmax_derived": 0, "wmax_shipped": 0, "wmax_bound_unavailable": 0}
+
+
+def _odd_double_factorial(k):
+    """(2k-1)!! = 1*3*5*...*(2k-1), computed in code -- never quoted from memory."""
+    p = 1
+    for i in range(1, int(k) + 1):
+        p *= (2 * i - 1)
+    return p
+
+
+def _ck(k):
+    """(2k-1)!! / (2^k * k!) -- the geometric factor of a half-step uniform extrapolation,
+    per unit h^k.  0.375, 0.3125, 0.2734, 0.2461 for k = 2..5."""
+    return _odd_double_factorial(k) / float((2 ** int(k)) * math.factorial(int(k)))
+
+
+def _uniform_halfstep_wmax(order):
+    """max|Lagrange weight| for extrapolating half a step past `order` uniform nodes.
+
+    Computed from the engine's OWN `_lagrange_weights`, so the cap and the consumer can never
+    drift apart.  Verified geometric (shift/scale invariant) in the rig.
+    """
+    order = int(order)
+    if order < 2:
+        return 0.0
+    us = [float(i) for i in range(order)]
+    u_t = us[-1] + 0.5
+    try:
+        return float(max(abs(w) for w in _lagrange_weights(us, u_t)))
+    except Exception:
+        return 0.0
+
+
+def _derived_wmax_cap(med_curv, log_gap, tol, dk=None, kmax=5, h_real=None,
+                      budget=1.0):
+    """The order the error bound permits, as a cap on max|Lagrange weight|.
+
+    `dk` MUST supply the per-order derivative scale `|d^k x0/du^k| / |x0|`, measured for each
+    k the caller wants certified.  An order is allowed only when it is BOTH measured and
+    within tolerance -- we certify, we do not assume.
+
+    WHY IT REFUSES WITHOUT `dk`: the first implementation substituted the k = 2 curvature for
+    every k.  `scratch_derived_cap_rig.py` measured that as NOT a bound -- the true error
+    exceeded it by a consistent 2.6-4.8x, which is the `c^(k-2)` factor the substitution drops
+    (c = 4.9 at k = 5 for the rig's ground truth).  It also caught a units bug in that rig:
+    comparing an ABSOLUTE error against a RELATIVE bound inflated the apparent failure to
+    113x.  Both are recorded so neither is re-derived.  Passing dk = None therefore returns
+    None, the caller keeps the shipped map, and `info["reason"]` says why.
+
+    PROPAGATED INTO STEP ERROR before comparing with `tol`, which is the second correction and
+    the one that made this arm refuse on every real run.  The step is
+    `exact_step(x, x0_mid, s, s2) = r*x + (1-r)*x0_mid` with `r = s2/s = exp(-h)`, so an error
+    EPS in the extrapolated x0_mid becomes `(1 - e^-h) * EPS` in the step.  `tol` bounds the
+    STEP error, so the comparison is `(1 - e^-h) * bound <= tol`.  Comparing the x0 error
+    against tol directly was ~70-100x too strict: measured bound(k=2) was 0.356 / 0.480 /
+    0.770 against tol 0.005 / 0.0067 / 0.0056, so no order ever qualified and wmax_bound was
+    inert on every run the operator made.
+
+    Returns (cap_or_None, info).
+
+    EVALUATED ON THE REAL GRID (`h_real`) when it is measured, because that is the grid the
+    cap is consumed on.  `log_gap_probe` is the PROBE grid's spacing, 1.9x-4.9x coarser than
+    the real one on the operator's own runs, and `h` enters as `h^k` -- so the comparison was
+    ratio^k (14x..2900x over k = 2..5) too strict and refused every order on every logged
+    run.  `scratch_extrap_remainder_rig.py` measures that directly: on the corpus' own
+    dk/rtol/grids the probe-gap form admits an order at 0/39 (anima) and 0/15 (krea) steps,
+    the real-gap form at 36/39 and 11/15.  Both rows are logged (`allowed` at the used h,
+    `allowed_probe` at the probe h) so one run shows the whole delta.
+
+    `budget` scales the tolerance THIS BOUND is compared against, and nothing else -- never
+    `rtol` itself, which the corrector also consumes.  It is the operator's nudge for the
+    one input that is not a measurement: `dk` is a trajectory statistic measured on the
+    probe grid, so it is not a per-step upper bound, and the rig quantifies that residual
+    (58 of 204 cases under-bound with the shipping median, up to 578-1807x at individual
+    steps).  Default 1.0 = neutral; the arm is bit-identical to no multiplier at 1.0.
+    """
+    info = {"k": None, "bound": None, "ck": None, "h": log_gap, "med_curv": med_curv,
+            "tol": tol, "cap": None, "allowed": [], "reason": None,
+            "prop": None, "dk_present": sorted(int(k) for k in (dk or {}))}
+    try:
+        h_probe = float(log_gap or 0.0)
+        c = float(med_curv or 0.0)
+        t = float(tol or 0.0)
+        budget = float(budget or 1.0)
+        t_eff = t * max(budget, 1e-6)
+        info["tol_rtol"] = t
+        info["budget"] = budget
+        info["tol_eff"] = t_eff
+        info["h_probe"] = h_probe
+        # WHICH GRID THE BOUND IS EVALUATED ON.  The cap is CONSUMED on the real schedule,
+        # so the remainder belongs on the real schedule too: `log_gap_probe` is the probe
+        # grid's spacing, which on the operator's own runs is 1.9x-4.9x COARSER than the
+        # real grid, making the bound ratio^k too strict -- measured, that alone refused
+        # every order on every logged run.  Both grids' bounds are reported so one run
+        # shows the whole delta.
+        h = h_probe
+        h_src = "probe"
+        try:
+            if h_real is not None and float(h_real) > 0.0:
+                h = float(h_real)
+                h_src = "real"
+        except (TypeError, ValueError):
+            pass
+        info["h_used"] = h
+        info["h_src"] = h_src
+        if not (h > 0.0 and c > 0.0 and t > 0.0):
+            info["reason"] = "degenerate input (need h > 0, curv > 0, tol > 0)"
+            return None, info
+        if not dk:
+            info["reason"] = ("per-order derivative scale not measured -- the k = 2 "
+                              "curvature is NOT a valid stand-in for |d^k x0/du^k|")
+            return None, info
+        # (1 - r) with r = s2/s = exp(-h): how much of an x0 error survives into the step
+        prop = 1.0 - math.exp(-h)
+        info["prop"] = round(prop, 8)
+        if not (prop > 0.0):
+            info["reason"] = "step factor (1 - exp(-h)) is not positive"
+            return None, info
+        best = None
+        for k in range(2, int(kmax) + 1):
+            d_scale = dk.get(k)
+            if d_scale is None:
+                info["allowed"].append([k, None, "not measured"])
+                continue
+            bound = _ck(k) * (h ** k) * float(d_scale)
+            step_err = prop * bound
+            info["allowed"].append([k, round(bound, 8), round(float(d_scale), 8),
+                                    round(step_err, 8)])
+            if step_err <= t_eff:
+                best = k
+        # the same rows at the PROBE gap, for the audit: the delta is the h correction
+        info["allowed_probe"] = [
+            [k, round(_ck(k) * (h_probe ** k) * float(dk[k]), 8)] if dk.get(k) else
+            [k, None] for k in range(2, int(kmax) + 1)]
+        if best is None:
+            info["reason"] = ("no measured order satisfies the bound at this tol, even "
+                              "after propagating the x0 error into the step")
+            return None, info
+        info["k"] = best
+        info["ck"] = round(_ck(best), 6)
+        info["bound"] = round(_ck(best) * (h ** best) * float(dk[best]), 8)
+        cap = _uniform_halfstep_wmax(best) * (1.0 + 1e-9)
+        info["cap"] = round(cap, 6)
+        return cap, info
+    except Exception as e:
+        info["reason"] = "exception: {}".format(e)
+        return None, info
+
+
+def _probe_pct(arr, p, derived=False):
+    """Percentile for probe statistics, with the corrected estimator under the toggle.
+
+    shipped : a[min(len(a)-1, int(p*len(a)))]  -- collides for n <= 2 and is biased at all n
+    derived : linear interpolation at position (n-1)*p -- the standard estimator
+    """
+    if not arr:
+        return 0.0
+    a = sorted(arr)
+    if not derived:
+        return a[min(len(a) - 1, int(p * len(a)))]
+    if len(a) == 1:
+        return a[0]
+    pos = (len(a) - 1) * p
+    lo = int(pos)
+    hi = min(lo + 1, len(a) - 1)
+    return a[lo] + (pos - lo) * (a[hi] - a[lo])
+
+
+def _measure_dk_scale(x0s, dl, kmax=5):
+    """Per-order derivative scale |d^k x0/du^k| / |x0|, measured from the probe trajectory.
+
+    WHY THIS EXISTS: `_derived_wmax_cap` refuses without it, because substituting the k = 2
+    curvature for every k was measured NOT to be a bound (the true error exceeded it by a
+    consistent 2.6-4.8x -- the c^(k-2) factor).  This supplies the real thing.
+
+    UNIFORM COEFFICIENTS ARE EXACT HERE: the probe grid is built log-uniform (`_probe_grid`),
+    so the spacing in u = log sigma is constant by construction and the k-th difference with
+    binomial coefficients is the right stencil.
+
+    DE-BIASED, because a raw difference is NOT the derivative for a non-polynomial.  For
+    x0 = e^{cu} the k-th difference over h gives exactly `e^{cu} * rho(ch)^k * c^k` with
+    `rho(x) = (1 - e^{-x}) / x`, so the raw estimate is LOW by `rho(ch)^k`.  Measured on an
+    analytic trajectory: raw/analytic = 0.75, 0.66, 0.58, 0.51 for k = 2..5 at ch = 0.255 --
+    matching rho(ch)^k = 0.78, 0.69, 0.61, 0.54 -- and dividing by it recovers the analytic
+    scale to a consistent 4.1 % at every order.  `ch` is measured, not assumed: c comes from
+    the trajectory's own first-difference scale.  The 4.1 % residual is the estimator's
+    accuracy and is reported rather than hidden behind a fudge factor.
+
+    AN ORDER THAT CANNOT BE MEASURED IS OMITTED, not approximated: a k-th difference needs
+    k + 1 consecutive samples.  On the 9-point engine grid k <= 5 is available; on a 3-point
+    cond grid only k = 2 is, and the cap then legitimately falls back to the shipped map.
+
+    MEDIAN OVER THE TRAJECTORY, NOT THE MAX.  The cap this feeds is ONE scalar applied at
+    every step, so it has to describe the TYPICAL step, not the worst one.  Measured: the max
+    is 19-27 for real runs, dominated by the tail where |x0| is small and relative curvature
+    explodes, and it made the bound 70-100x larger than tol so NO order ever qualified and
+    the arm was inert on every run.  The shipped map it replaces is also built from a MEDIAN
+    (`med_curv`), so the median is the consistent statistic.
+    """
+    out = {}
+    try:
+        m = len(x0s)
+        h = float(dl or 0.0)
+        if m < 3 or not (h > 0.0):
+            return out
+        norms = [float(t.float().norm()) for t in x0s]
+
+        def _diff(k, i):
+            coeff = [((-1) ** j) * math.comb(k, j) for j in range(k + 1)]
+            acc = None
+            for j, c in enumerate(coeff):
+                term = x0s[i - j].float() * float(c)
+                acc = term if acc is None else acc + term
+            return acc
+
+        # the local exponential rate, from the measured first-difference scale
+        d1 = 0.0
+        for i in range(1, m):
+            ref = max(norms[i - 1], norms[i])
+            d1 = max(d1, float(_diff(1, i).norm()) / h / max(ref, 1e-8))
+        ch = d1 * h
+        rho = ((1.0 - math.exp(-ch)) / ch) if ch > 1e-9 else 1.0
+        if not (rho > 0.0):
+            rho = 1.0
+
+        for k in range(2, int(kmax) + 1):
+            if m < k + 1:
+                break
+            vals = []
+            for i in range(k, m):
+                d = _diff(k, i)
+                if d is None:
+                    continue
+                ref = max(norms[i - k:i + 1]) if norms[i - k:i + 1] else 1.0
+                vals.append(float(d.norm()) / (h ** k) / max(ref, 1e-8))
+            if vals:
+                vals.sort()
+                med = vals[len(vals) // 2] if len(vals) % 2 else \
+                    0.5 * (vals[len(vals) // 2 - 1] + vals[len(vals) // 2])
+                if med > 0.0:
+                    out[k] = med / (rho ** k)
+        return out
+    except Exception:
+        return out
+
+
+def _calib_flags(profile):
+    f = profile.get(_CALIB_FLAGS_KEY) if isinstance(profile, dict) else None
+    if not isinstance(f, dict):
+        return {}
+    return f
+
+
+def _calib_inputs(cfg):
+    """The inputs that CHANGE a calibration, as one comparable record.
+
+    These are stamped on the profile as `calib_flags` (the key it already had) and the
+    calibration is re-derived from the profile's own MEASUREMENTS whenever the live cfg
+    differs from the stamp.  The measurements -- `dk_scale`, `med_curv`, the gap fields --
+    do not depend on any of these inputs, which is why re-deriving is exact and why a
+    slider nudge must never cost a re-probe.  Without this the cached profile keeps the
+    calibration it was built with: log_00159 reports `wmax_bound=False` in its cfg while
+    its `calib_flags` say the arm was ON, i.e. the run did not do what the switch said.
+    """
+    try:
+        budget = round(float(cfg.get("wmax_budget", 1.0) or 1.0), 6)
+    except (TypeError, ValueError):
+        budget = 1.0
+    return {"pct_derived": bool(cfg.get("pct_derived", False)),
+            "wmax_bound": bool(cfg.get("wmax_bound", False)),
+            "wmax_budget": budget}
+
+
 def _derive_calibrations(profile):
     calib = {}
     med_curv = profile.get("med_curv", 0.0)
@@ -2355,9 +3939,31 @@ def _derive_calibrations(profile):
         else:
             t = (lc - math.log(1.5)) / (math.log(5.0) - math.log(1.5))
             wb = 3.0 - t * (3.0 - 1.8)
-        calib["wmax_base"] = round(max(1.5, min(2.5, wb)), 3)
+        _flags = _calib_flags(profile)
+        _wb_shipped = round(max(1.5, min(2.5, wb)), 3)
+        _wb_cap, _wb_info = _derived_wmax_cap(
+            med_curv, profile.get("log_gap_probe"), calib.get("rtol"),
+            dk=profile.get("dk_scale"),
+            # the grid the cap is CONSUMED on, and the operator's nudge (see the helper)
+            h_real=gap_r,
+            budget=float(_flags.get("wmax_budget", 1.0) or 1.0))
+        _use_derived_wb = bool(_flags.get("wmax_bound")) and _wb_cap is not None
+        calib["wmax_base"] = (round(_wb_cap, 6) if _use_derived_wb else _wb_shipped)
+        # BOTH values are logged whatever the toggle, so one run shows the whole delta and
+        # the A/B needs no second run to be readable.
+        calib["wmax_shipped"] = _wb_shipped
+        calib["wmax_bound"] = (round(_wb_cap, 6) if _wb_cap is not None else None)
+        calib["wmax_ab"] = _wb_info
+        if _flags.get("wmax_bound"):
+            if _wb_cap is not None:
+                _CALIB_AB["wmax_derived"] += 1
+            else:
+                _CALIB_AB["wmax_bound_unavailable"] += 1
+        else:
+            _CALIB_AB["wmax_shipped"] += 1
     calib["safe_eta"] = round(min(1.0, max(0.1, math.sqrt(max(safe_f, 1e-4)))), 3)
     calib.update(_derive_anomaly_calibrations(profile))
+    calib["calib_ab_counts"] = dict(_CALIB_AB)
     return calib
 
 def _derive_anomaly_calibrations(profile):
@@ -2583,7 +4189,8 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
         C = x.shape[1]
         if B < 1 or C < 1:
             return None
-        shape = _probe_latent_shape(ref_x=x, pres=pres, batch=B)
+        shape = _probe_latent_shape(ref_x=x, pres=pres, batch=B,
+                                    site="engine/_run_probe")
         px = torch.randn(shape, device=x.device, dtype=torch.float32,
                          generator=_probe_gen(x)).to(x.dtype)
         ones = px.new_ones([B])
@@ -2800,10 +4407,15 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
                         / (len(pos_all) - 1))
 
         def _pct(arr, p):
-            if not arr:
-                return 0.0
-            a = sorted(arr)
-            return a[min(len(a) - 1, int(p * len(a)))]
+            # The shipped body was `a[min(len(a)-1, int(p*len(a)))]`, which COLLIDES for
+            # n <= 2 (int(0.5*2) == int(0.9*2) == 1, so p90 IS the median -- this is what
+            # made guard_floor a constant 0.075) and is biased at every n (at n = 10 it
+            # returns the maximum for p = 0.9).  Toggle: cfg["pct_derived"].  Counted for
+            # reachability: a toggle wired to nothing looks exactly like one whose effect
+            # is below the noise floor.
+            _pd = bool(cfg.get("pct_derived", False)) if isinstance(cfg, dict) else False
+            _CALIB_AB["pct_derived" if _pd else "pct_shipped"] += 1
+            return _probe_pct(arr, p, derived=_pd)
 
         med_jump = _pct(jumps, 0.5)
         med_curv = _pct(curvs, 0.5)
@@ -2842,12 +4454,42 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
             pos_all_eg = [float(v) for v in sigmas if float(v) > 1e-6]
             endgame = _probe_endgame(model, extra_args, x0s[-1], grid[-1],
                                      pos_all_eg, ones, space, _probe_gen(x))
+        # Computed ONCE here so the profile dict below can carry BOTH the curve
+        # and its per-term breakdown without walking the trajectory twice.  The
+        # breakdown matters: measured on the real corpus the probe curve lands
+        # ~10x BELOW the run's (probe p50 0.0000 vs a run p50 of 0.27-0.41), and
+        # the gate is a 4-way AND -- without the per-conjunct pass rates that
+        # failure cannot be attributed to any one term.
+        _cov_r = _lf_rescue_cov_curve(
+            xs, x0s, grid, _eg_n_from_err(_endgame_eg_err(endgame)), 0.0)
         profile = {
             "version": 7,
             "space": space,
             "n_probe_steps": m,
             "sigma_curve": [round(v, 6) for v in grid],
             "jump_curve": [round(v, 6) for v in jumps],
+            # Per-step probe diagnostics.  Why: a profile can report
+            # jump_curve == 0 while the SAME model, in the real run, moves x0
+            # strongly -- measured on Krea2 (probe jump 0,0,0 against the run's
+            # own x0_jump_rms 1.17, 0.35, 0.28, ...), so the probe, not the
+            # model, is what fails there.  The probe advances x with
+            # exact_step(x, x0, s, s2) = r*x + (1-r)*x0, r = s2/s, so a frozen
+            # trajectory has exactly two causes a bare jump_curve cannot
+            # separate:
+            #   x0_minus_x_rel ~ 0  -> the model call returned x0 == x (zero
+            #                          velocity): the CALL is degenerate
+            #   x0_minus_x_rel  > 0 -> the model answered and x still does not
+            #                          move: the grid/step is degenerate
+            # x_norm across the list shows whether x moved at all.
+            "probe_diag": [
+                {"s": round(float(grid[i]), 6),
+                 "x_norm": round(float(xs[i].float().norm()), 6),
+                 "x0_norm": round(float(x0s[i].float().norm()), 6),
+                 "x0_minus_x_rel": round(
+                     float((x0s[i].float() - xs[i].float()).norm())
+                     / max(float(xs[i].float().norm()), 1e-8), 8)}
+                for i in range(min(len(xs), len(x0s), len(grid)))
+            ],
             "gap_curve": [round(v, 6) for v in gap_curve],
             "real_gap_curve": [round(v, 6) for v in real_gap_curve],
             "local_err_curve": [round(v, 6) for v in local_errs],
@@ -2856,8 +4498,38 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
             "med_local_err_real": (_pct(local_errs_real, 0.5)
                                    if local_errs_real else 0.0),
             "curv_curve": [round(v, 6) for v in curvs],
+            # PROBE-SIDE COVERAGE CURVE.  The same statistic the rescue gate
+            # consumes in the run (`frac`), computed along THIS probe trajectory
+            # by the SAME function, so a pitfall like the coverage cliff can be
+            # seen BEFORE sampling rather than diagnosed afterwards.  The probe is
+            # the only instrument that measures the model AND the prompt first.
+            # See NOTES.md and scratch_rescue_cliff_rig.py.
+            "cov_curve": (_cov_r or {}).get("curve"),
+            "cov_curve_terms": (_cov_r or {}).get("terms"),
+            # The DERIVED variant (ref_drop = k*du, k measured from this very
+            # trajectory) alongside the shipped per-step curve.  Both are emitted
+            # so the next real runs can decide which one actually tracks the run:
+            # synthetic fields could not, see scratch_ref_decay_rig.py.
+            "cov_curve_kdu": (_cov_r or {}).get("curve_kdu"),
+            "cov_curve_k": (_cov_r or {}).get("k"),
+            # WHICH probe model-call path ran, and with what arguments.  139 of
+            # 224 profiles are frozen (model returns its input); this is what will
+            # identify the cause on the next frozen run.
+            "probe_call": dict(_PROBE_CALL_DIAG),
+            "cov_curve_meta": _lf_rescue_cov_meta(
+                x0s[-1] if x0s else None, _endgame_eg_err(endgame)),
             "med_jump": med_jump,
             "med_curv": med_curv,
+            # THE PER-ORDER DERIVATIVE SCALE, measured from this very trajectory.  Without it
+            # the derived wmax cap refuses (see _derived_wmax_cap), so this is what lets the
+            # `wmax_bound` arm engage at all.  Omitted orders are ones this grid is too short
+            # to certify, and the cap then falls back rather than guessing.
+            "dk_scale": _measure_dk_scale(x0s, gap_probe),
+            # THE A/B FLAGS THIS PROFILE WAS BUILT UNDER.  `_calib_flags` reads this, and
+            # without it the `wmax_bound` arm was INERT whatever the widget said -- a toggle
+            # wired to nothing, which is indistinguishable from one whose effect is below the
+            # noise floor (the exact trap rule 9 exists for).  `cfg` is in scope here.
+            _CALIB_FLAGS_KEY: _calib_inputs(cfg),
             "med_jump_rel": med_jump_rel,
             "med_detail_abs": med_detail_abs,
             "early_frac": early_frac,
@@ -2872,6 +4544,16 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
             "med_local_err": (_pct(local_errs, 0.5) if local_errs else 0.0),
             "guard_sig_med": (_pct(guard_sigs, 0.5) if guard_sigs else 0.0),
             "guard_sig_p90": (_pct(guard_sigs, 0.9) if guard_sigs else 0.0),
+            # BOTH estimators logged whatever the toggle, so one run shows the delta and,
+            # with `n_guard`, whether the p90/med collision is in play for this profile.
+            "guard_sig_med_shipped": (_probe_pct(guard_sigs, 0.5, False)
+                                      if guard_sigs else 0.0),
+            "guard_sig_p90_shipped": (_probe_pct(guard_sigs, 0.9, False)
+                                      if guard_sigs else 0.0),
+            "guard_sig_med_derived": (_probe_pct(guard_sigs, 0.5, True)
+                                      if guard_sigs else 0.0),
+            "guard_sig_p90_derived": (_probe_pct(guard_sigs, 0.9, True)
+                                      if guard_sigs else 0.0),
             "log_gap_probe": gap_probe,
             "log_gap_real": gap_real,
             "n_jump": len(jumps),
@@ -2894,10 +4576,51 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
         logging.warning("[A-FloPS-probe] probe failed: %s", e)
         return None
 
+def _recalibrated(profile, cfg, derive):
+    """The profile with its calibration re-derived for THIS run's inputs.
+
+    WHY THIS EXISTS: `profile["calib"]` is computed once, when the profile is built, and a
+    profile is CACHED and reused across runs.  So a cached profile carries the calibration
+    of whatever inputs were live when it was built -- log_00159 reports `wmax_bound=False`
+    in its cfg while its own `calib_flags` say the arm was ON, i.e. the run did not do what
+    the switch said.  Re-deriving here is exact (every measurement the derivation reads --
+    `dk_scale`, `med_curv`, the gap fields -- is independent of the switches and of the
+    budget) and free (pure arithmetic: no probe, no model call).  That is what makes a
+    slider nudge take effect immediately instead of needing a re-probe.
+
+    Returns the SAME object when the inputs already match, so the common path allocates
+    nothing.  When they differ it updates the profile IN PLACE, deliberately: the report
+    logs the cached profile objects themselves (`nodes.py` reads `_PROBE_PROFILES`), so
+    copying would leave the log showing a calibration that did not run -- the same class of
+    gap as a switch that reports ON while running OFF.
+    """
+    if not isinstance(profile, dict):
+        return profile
+    want = _calib_inputs(cfg)
+    if _calib_flags(profile) == want:
+        return profile
+    profile[_CALIB_FLAGS_KEY] = want
+    try:
+        profile["calib"] = derive(profile)
+    except Exception:
+        pass
+    return profile
+
+
 def _apply_probe_profile(cfg, profile, tune, auto_tunable=None):
     if not profile:
         return
+    profile = _recalibrated(profile, cfg, _derive_calibrations)
     calib = profile.get("calib", {})
+    # THE PER-ORDER DERIVATIVE SCALE, plumbed to the run so the remainder gate can consume
+    # it.  It is a measurement from the engine probe; the cond probe only supplies it when
+    # no model-site measurement exists (its grid is shorter, so it certifies fewer orders).
+    try:
+        _dk = profile.get("dk_scale")
+        if isinstance(_dk, dict) and _dk:
+            cfg["_dk_scale"] = {int(k): float(v) for k, v in _dk.items()}
+    except Exception:
+        pass
     if auto_tunable is None:
         auto_tunable = {k for k in ENGINE_DEFAULTS
                         if cfg.get(k) == ENGINE_DEFAULTS[k]}
@@ -3201,19 +4924,63 @@ def _engine_cond_probe_run(model_patcher, positive, negative, cfg_scale,
                 return None
         if not (s_max > 1e-6):
             return None
+        # ---- WHICH PATCHER: clone (restored) -------------------------------
+        # The clone-removal experiment ran, was measured ineffective, and is
+        # reverted below.  See "THE CLONE-REMOVAL EXPERIMENT" for the numbers.
+        # WHY THIS CHANGED.  `clone()` re-uses the SAME model object, so it was
+        # never a different model: get_clone_model_override returns self.model
+        # (model_patcher.py:428-429), is_clone is `self.model is other.model`
+        # (:592-595), and the module that actually runs is _prepare_sampling's
+        # `real_model = model.model` (sampler_helpers.py:202).
+        #
+        # THE EVIDENCE FOR THIS CHANGE IS EMPIRICAL, NOT MECHANISTIC.  Measured
+        # over every build (probe_call.ret_rel): every clone-path probe returned
+        # its own input for all seven non-anima models (node 56 frozen / 0
+        # healthy, cond 114 frozen / 0), while the SAME `_run_probe` on the real
+        # patcher is healthy for every model (engine 0 frozen / 60 healthy);
+        # anima is healthy on all three sites.  So
+        #     frozen <=> (clone path) AND (model is not anima)
+        # and the real patcher is the one variable that is healthy on every model.
+        #
+        # ---- THE CLONE-REMOVAL EXPERIMENT: RUN, MEASURED, REVERTED -----------
+        # The clone was removed to test whether the frozen node/cond probes were
+        # caused by it.  **THEY WERE NOT.**  On build b70ccf9fb59a -- the first
+        # build where the removal was provably live in the running code (the log
+        # carries `probe_patcher: "real"`, and the src_hash confirms the module
+        # was re-imported) -- the NODE probe on cielbleuKrea2_v1-int8 STILL
+        # returned its own input (ret_rel exactly 0.0, rank 5, [1,16,1,48,48])
+        # while the GENUINE engine probe in the SAME run, on the SAME REAL
+        # patcher, was healthy (ret_rel 0.00812805).  Same patcher, opposite
+        # outcomes: the clone was never the discriminator.  The experiment is
+        # CLOSED, and the clone is restored.
+        #
+        # The two earlier candidate mechanisms are ALSO settled -- do not
+        # re-derive either:
+        #   * patcher bookkeeping (patches_uuid copied unchanged, :450): the
+        #     parent and the clone share ONE uuid, so it computes identically on
+        #     both paths.  scratch_uuid_identity_rig.py (20/20) settled that.
+        #   * the SQUARE synthetic latent: the node and engine probes pass the
+        #     IDENTICAL shape at the identical rank, and only one is frozen.
+        #
+        # WHAT IS STILL OPEN: the node/cond paths freeze for a reason that
+        # survives all three.  They differ from the healthy engine call in the
+        # SYNTHETIC NESTED guider.sample RUN, not in the patcher and not in the
+        # latent.  That is the remaining lead -- do NOT re-run the clone.
+        #
+        # Restoring the clone also restores deliberate isolation: the probing run
+        # stays shape-private and away from the model's internal caches (see
+        # _probe_model_options), and because clone() shares the
+        # transformer_options dict with the original patcher, the sanitized dicts
+        # REPLACE (never mutate) the clone's model_options.
         clone = model_patcher.clone()
-        # The probing run is a shape-private execution: keep it away from the
-        # model's internal caches exactly like every probe model call (see
-        # _probe_model_options).  clone() shares the transformer_options dict
-        # with the original patcher, so the sanitized dicts replace (never
-        # mutate) the clone's model_options.
+        _probe_mopt = None
         try:
-            _clone_mopt = _probe_model_options(
+            _probe_mopt = _probe_model_options(
                 {"model_options": getattr(clone, "model_options", None)})
-            if _clone_mopt is not None:
-                clone.model_options = _clone_mopt
+            if _probe_mopt is not None:
+                clone.model_options = _probe_mopt
         except Exception:
-            pass
+            _probe_mopt = None
         guider = _Guider(clone)
         if not _set_probe_guider_conds(guider, positive, negative):
             return None
@@ -3282,6 +5049,22 @@ def _engine_cond_probe_run(model_patcher, positive, negative, cfg_scale,
                          "prepared by the runtime: load_models_gpu + "
                          "additional models, cuda_device_context, "
                          "cast_to_load_options, pre_run)", probe_kind)
+            # WHICH PATCHER THE PROBE RAN ON, stamped onto the PROFILE itself.
+            # Deliberately NOT in _PROBE_CALL_DIAG: _probe_model_call clears that
+            # dict at its start (aflops.py:3162), so anything written here would
+            # be wiped before the call that consumes it -- the exact
+            # instrumentation bug this project has already hit once.  On the
+            # profile it cannot be clobbered, and it lands in the corpus (both
+            # nodes.py whitelists now name it -- before that it was silently
+            # dropped, and its ABSENCE was misread as "the change did not ship").
+            # Current value is "clone"; a build that prints "real" is one running
+            # the reverted clone-removal experiment.
+            try:
+                holder["profile"]["probe_patcher"] = "clone"
+                holder["profile"]["probe_mopt_swapped"] = bool(
+                    _probe_mopt is not None)
+            except Exception:
+                pass
         return holder["profile"]
     except Exception as e:
         import traceback as _tb
@@ -3348,10 +5131,37 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
             C = int(mi["latent_channels"])
         else:
             C = _fallback_latent_channels()
-        shape = _probe_latent_shape(ref_x=None, pres=pres, batch=B,
-                                    channels=C, patcher=model_patcher, mi=mi)
-        profile = _engine_cond_probe_run(model_patcher, positive, negative,
-                                         cfg_scale, cfg, sigmas, shape)
+        # ---- RANK LADDER, DRIVEN BY DEGENERACY (same reason as the model
+        # probe above: ref_x is None, and a 4-D latent through a 5-D model is a
+        # SILENT pass-through, so no exception is available to drive this).
+        _ladder = _probe_rank_ladder(model_patcher, None, mi)
+
+        def _run_at_rank(_rank):
+            _shape = _probe_latent_shape(
+                ref_x=None, pres=pres, batch=B, channels=C, rank=_rank,
+                patcher=model_patcher, mi=mi,
+                site="node/_run_node_side_cond_probe")
+            return _engine_cond_probe_run(model_patcher, positive, negative,
+                                          cfg_scale, cfg, sigmas, _shape)
+
+        profile, _rank_used, _tried = _probe_rank_ladder_run(
+            _run_at_rank, _ladder, _probe_degenerate)
+        if profile is not None:
+            try:
+                profile["probe_rank"] = _rank_used
+                profile["probe_rank_tried"] = list(_tried)
+                profile["probe_rank_ladder"] = list(_ladder)
+            except Exception:
+                pass
+            # REMEMBER THE WORKING RANK so the ladder is paid ONCE PER MODEL,
+            # not once per prompt.  The cond probe is per-prompt and NOT cached
+            # across prompts, so without this an affected model would run a
+            # doubled chain on every new prompt.  With it, _resolve_probe_rank
+            # short-circuits to the working rank and the ladder settles first
+            # try.  Correctness is unaffected: a remembered rank that still
+            # produced a degenerate profile would simply advance again.
+            if _rank_used in (4, 5):
+                _remember_probe_rank(model_patcher, _rank_used)
         if profile is None:
             # No hand-rolled fallback: if the node-side chain run could not
             # execute, defer to the engine-side probe, which runs inside the
@@ -3406,13 +5216,24 @@ def _run_node_side_cond_probe_guider(guider, cfg, cfg_scale=None,
 
 def _node_probe_param_sig(cfg):
     """Fingerprint of the probe parameters that are baked into a model
-    profile's measurement (widget changes must invalidate the cache)."""
+    profile's measurement (widget changes must invalidate the cache).
+
+    THE CALIB FLAGS BELONG HERE.  They change what the profile MEASURES -- which
+    percentile estimator is used, and which wmax cap is derived -- so a profile built
+    under one setting must not be reused after the switch is flipped.  They were missing,
+    which produced exactly the symptom the operator reported twice: flipping the switch
+    changed nothing, because `_PROBE_PROFILES.get(pkey)` hit the cached profile and the
+    engine trusts an exact-key hit as-is.  The stale profile even carried the OLD
+    `calib_flags` in its own log, which is how the reuse was visible.
+    """
     return "|".join([
         str(int(cfg.get("probe_steps", 10))),
         str(int(cfg.get("probe_resolution", 48))),
         "d" if bool(cfg.get("probe_distributions", True)) else "-",
         "e" if bool(cfg.get("probe_endgame", True)) else "-",
         "c" if bool(cfg.get("probe_dir_cons", True)) else "-",
+        "pd" if bool(cfg.get("pct_derived", False)) else "-",
+        "wb" if bool(cfg.get("wmax_bound", False)) else "-",
     ])
 
 
@@ -3501,8 +5322,14 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
             C = int(mi["latent_channels"])
         else:
             C = _fallback_latent_channels()
-        shape = _probe_latent_shape(ref_x=None, pres=pres, batch=B,
-                                    channels=C, patcher=patcher, mi=mi)
+        # ---- RANK LADDER, DRIVEN BY DEGENERACY --------------------------
+        # `ref_x` is None here, so the rank comes from detection and falls back
+        # to 4.  A 4-D latent through a 5-D model runs SUCCESSFULLY and returns
+        # its input, so nothing is raised and the ladder cannot be
+        # exception-driven -- it must test the profile itself.  Measured on the
+        # corpus: rank 4 -> 9 frozen / 0 healthy, rank 5 -> 0 frozen / 16 healthy.
+        # See scratch_rank_ladder_rig.py.
+        _ladder = _probe_rank_ladder(patcher, None, mi)
 
         def _probe_fn(model, x, extra_args=None):
             prof = _run_probe(model, x, sigmas, dict(extra_args or {}), cfg)
@@ -3510,9 +5337,27 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
                 prof["probe_cfg"] = eff_cfg
             return prof
 
-        profile = _engine_cond_probe_run(
-            patcher, positive, negative, eff_cfg, cfg, sigmas, shape,
-            probe_fn=_probe_fn, probe_kind="model")
+        def _run_at_rank(_rank):
+            _shape = _probe_latent_shape(
+                ref_x=None, pres=pres, batch=B, channels=C, rank=_rank,
+                patcher=patcher, mi=mi,
+                site="node/_run_node_side_model_probe")
+            return _engine_cond_probe_run(
+                patcher, positive, negative, eff_cfg, cfg, sigmas, _shape,
+                probe_fn=_probe_fn, probe_kind="model")
+
+        profile, _rank_used, _tried = _probe_rank_ladder_run(
+            _run_at_rank, _ladder, _probe_degenerate)
+        if profile is not None:
+            try:
+                profile["probe_rank"] = _rank_used
+                profile["probe_rank_tried"] = list(_tried)
+                profile["probe_rank_ladder"] = list(_ladder)
+            except Exception:
+                pass
+            # Remember it (see the cond-probe twin above): pay the ladder once.
+            if _rank_used in (4, 5):
+                _remember_probe_rank(patcher, _rank_used)
         if profile is None:
             # No hand-rolled fallback: the engine-side probe (inside the
             # real sampling run, through the very same ComfyUI chain) takes
@@ -3636,9 +5481,26 @@ def _compute_trajectory_state(profile):
         for sv in signals:
             not_oversteer *= (1.0 - sv)
         oversteer = max(0.0, min(1.0, 1.0 - not_oversteer ** (1.0 / len(signals))))
-        if is_distilled:
+        if _OSM_AB_MODE == "off":
             oversmooth = 0.0
+        elif _OSM_AB_MODE == "reanchored":
+            if trend_resid is not None:
+                s_osm_conv = max(0.0, min(1.0, (_OSM_RA_TREND_ZERO - trend_resid)
+                                             / _OSM_RA_TREND_W))
+            else:
+                s_osm_conv = max(0.0, min(1.0, (_OSM_RA_CONV_ZERO - conv_ratio)
+                                             / _OSM_RA_CONV_W))
+            s_osm_curv = max(0.0, min(1.0, (_OSM_RA_CURV_ZERO - late_curv_ratio)
+                                         / _OSM_RA_CURV_W))
+            s_osm_err = max(0.0, min(1.0, (_OSM_RA_ERR_ZERO - med_err)
+                                        / _OSM_RA_ERR_W))
+            oversmooth = max(0.0, min(1.0,
+                s_osm_conv * (0.7 + 0.3 * max(s_osm_curv, s_osm_err))))
         else:
+            # "engine": original absolute thresholds.  The distilled early-out
+            # that used to live here was removed at the operator's request; it
+            # changes nothing on its own because these thresholds still gate
+            # every distilled profile to zero.
             if trend_resid is not None:
                 s_osm_conv = max(0.0, min(1.0, (-3.2 - trend_resid) / 0.8))
             else:
@@ -3944,6 +5806,18 @@ def _derive_cond_calibrations(profile):
         r = sig_p90 / sig_med
         calib["guard_floor"] = round(
             min(0.5, max(0.05, 0.15 * math.sqrt(max(r, 0.25) / 4.0))), 4)
+    # ORDER MATTERS: the gap-strength adjustment is applied BEFORE the wmax cap is derived,
+    # because the cap is compared against `calib["rtol"]` -- the tolerance the run will
+    # actually use.  Deriving the cap first and adjusting rtol afterwards (the shipped
+    # order) made the logged `rtol` and the tol the cap consumed differ by the 1.5x factor:
+    # anima log_00159 records `rtol` 0.0075 with `wmax_ab.tol` 0.005.
+    gap = profile.get("gap")
+    if gap is not None:
+        strength = float(gap.get("strength", 1.0))
+        if strength < 0.5 and "rtol" in calib:
+            calib["rtol"] = round(min(0.04, calib["rtol"] * 1.5), 4)
+        elif strength > 2.0 and "guard_floor" in calib:
+            calib["guard_floor"] = round(max(0.05, calib["guard_floor"] * 0.7), 4)
     if med_curv > 0:
         lc = math.log(max(med_curv, 1e-8) + 1.0)
         if lc < math.log(1.5):
@@ -3953,18 +5827,30 @@ def _derive_cond_calibrations(profile):
         else:
             t = (lc - math.log(1.5)) / (math.log(5.0) - math.log(1.5))
             wb = 3.0 - t * (3.0 - 1.8)
-        calib["wmax_base"] = round(max(1.5, min(2.5, wb)), 3)
+        _flags = _calib_flags(profile)
+        _wb_shipped = round(max(1.5, min(2.5, wb)), 3)
+        _wb_cap, _wb_info = _derived_wmax_cap(
+            med_curv, profile.get("log_gap_probe"), calib.get("rtol"),
+            dk=profile.get("dk_scale"),
+            h_real=gap_r,
+            budget=float(_flags.get("wmax_budget", 1.0) or 1.0))
+        _use_derived_wb = bool(_flags.get("wmax_bound")) and _wb_cap is not None
+        calib["wmax_base"] = (round(_wb_cap, 6) if _use_derived_wb else _wb_shipped)
+        calib["wmax_shipped"] = _wb_shipped
+        calib["wmax_bound"] = (round(_wb_cap, 6) if _wb_cap is not None else None)
+        calib["wmax_ab"] = _wb_info
+        if _flags.get("wmax_bound"):
+            if _wb_cap is not None:
+                _CALIB_AB["wmax_derived"] += 1
+            else:
+                _CALIB_AB["wmax_bound_unavailable"] += 1
+        else:
+            _CALIB_AB["wmax_shipped"] += 1
     if med_err > 0:
         calib["safe_eta"] = round(
             max(0.1, min(1.0, 0.7 / (med_err * 20.0 + 1.0))), 3)
-    gap = profile.get("gap")
-    if gap is not None:
-        strength = float(gap.get("strength", 1.0))
-        if strength < 0.5 and "rtol" in calib:
-            calib["rtol"] = round(min(0.04, calib["rtol"] * 1.5), 4)
-        elif strength > 2.0 and "guard_floor" in calib:
-            calib["guard_floor"] = round(max(0.05, calib["guard_floor"] * 0.7), 4)
     calib.update(_derive_anomaly_calibrations(profile))
+    calib["calib_ab_counts"] = dict(_CALIB_AB)
     return calib
 
 def _inherit_base_guard_stats(focused, base):
@@ -4118,7 +6004,8 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         C = x.shape[1]
         if B < 1 or C < 1:
             return None
-        shape = _probe_latent_shape(ref_x=x, pres=pres, batch=B)
+        shape = _probe_latent_shape(ref_x=x, pres=pres, batch=B,
+                                    site="engine/_run_focused_cond_probe")
         px = torch.randn(shape, device=x.device, dtype=torch.float32,
                          generator=_probe_gen(x)).to(x.dtype)
         ones = px.new_ones([B])
@@ -4247,6 +6134,14 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                       "A-FloPS focused probe: endgame")
             endgame = _probe_endgame(model, extra_args, x0s[-1], grid[-1],
                                      pos_all, ones, space, _probe_gen(x))
+        # Computed ONCE here so the profile dict below can carry BOTH the curve
+        # and its per-term breakdown without walking the trajectory twice.  The
+        # breakdown matters: measured on the real corpus the probe curve lands
+        # ~10x BELOW the run's (probe p50 0.0000 vs a run p50 of 0.27-0.41), and
+        # the gate is a 4-way AND -- without the per-conjunct pass rates that
+        # failure cannot be attributed to any one term.
+        _cov_r = _lf_rescue_cov_curve(
+            xs, x0s, grid, _eg_n_from_err(_endgame_eg_err(endgame)), 0.0)
         profile = {
             "version": 7,
             "cond_sig": cfg.get("cond_probe_sig"),
@@ -4260,15 +6155,51 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             "med_local_err_real": (sorted(local_errs_real)[len(local_errs_real) // 2]
                                    if local_errs_real else 0.0),
             "curv_curve": [round(v, 6) for v in curvs],
-            "med_jump": (sorted(jumps)[len(jumps) // 2] if jumps else 0.0),
-            "med_curv": (sorted(curvs)[len(curvs) // 2] if curvs else 0.0),
+            # PROBE-SIDE COVERAGE CURVE -- see the note on the model-probe copy.
+            # This is the FOCUSED cond probe, i.e. the per-prompt one that runs
+            # over the fragile band, so its curve is the most directly comparable
+            # to what the run's rescue gate will see late in sampling.
+            "cov_curve": (_cov_r or {}).get("curve"),
+            "cov_curve_terms": (_cov_r or {}).get("terms"),
+            # The DERIVED variant (ref_drop = k*du, k measured from this very
+            # trajectory) alongside the shipped per-step curve.  Both are emitted
+            # so the next real runs can decide which one actually tracks the run:
+            # synthetic fields could not, see scratch_ref_decay_rig.py.
+            "cov_curve_kdu": (_cov_r or {}).get("curve_kdu"),
+            "cov_curve_k": (_cov_r or {}).get("k"),
+            # WHICH probe model-call path ran, and with what arguments.  139 of
+            # 224 profiles are frozen (model returns its input); this is what will
+            # identify the cause on the next frozen run.
+            "probe_call": dict(_PROBE_CALL_DIAG),
+            "cov_curve_meta": _lf_rescue_cov_meta(
+                x0s[-1] if x0s else None, _endgame_eg_err(endgame)),
+            # THIRD PERCENTILE IMPLEMENTATION, and the one that actually produced the frozen
+            # guard_floor: this focused/cond builder used raw indexing, so the `_pct` toggle
+            # did NOT reach it.  At n_guard = 2, `len//2` and `int(n*0.9)` are both 1 -- the
+            # same element -- which is the collision.  Now it honours the same toggle, and
+            # logs both estimators so one run shows the delta.
+            "med_jump": _probe_pct(jumps, 0.5,
+                                   derived=bool(cfg.get("pct_derived", False))),
+            "med_curv": _probe_pct(curvs, 0.5,
+                                   derived=bool(cfg.get("pct_derived", False))),
+            # the per-order derivative scale this trajectory can certify (see the model
+            # builder for why it exists); a 3-point grid certifies only k = 2.
+            "dk_scale": _measure_dk_scale(
+                x0s, (sum(gap_curve) / len(gap_curve) if gap_curve else 0.0)),
+            # the A/B flags this profile was built under -- see the model builder for why
+            # this must be here or the `wmax_bound` arm stays inert.
+            _CALIB_FLAGS_KEY: _calib_inputs(cfg),
             "is_distilled_eff": is_distilled_eff,
-            "med_local_err": (sorted(local_errs)[len(local_errs) // 2]
-                              if local_errs else 0.0),
-            "guard_sig_med": (sorted(guard_sigs)[len(guard_sigs) // 2]
-                              if guard_sigs else 0.0),
-            "guard_sig_p90": (sorted(guard_sigs)[int(len(guard_sigs) * 0.9)]
-                              if guard_sigs else 0.0),
+            "med_local_err": _probe_pct(local_errs, 0.5,
+                                        derived=bool(cfg.get("pct_derived", False))),
+            "guard_sig_med": _probe_pct(guard_sigs, 0.5,
+                                        derived=bool(cfg.get("pct_derived", False))),
+            "guard_sig_p90": _probe_pct(guard_sigs, 0.9,
+                                        derived=bool(cfg.get("pct_derived", False))),
+            "guard_sig_med_shipped": _probe_pct(guard_sigs, 0.5, False),
+            "guard_sig_p90_shipped": _probe_pct(guard_sigs, 0.9, False),
+            "guard_sig_med_derived": _probe_pct(guard_sigs, 0.5, True),
+            "guard_sig_p90_derived": _probe_pct(guard_sigs, 0.9, True),
             "log_gap_probe": (sum(gap_curve) / len(gap_curve) if gap_curve else 0.0),
             "log_gap_real": (sum(real_gap_curve) / len(real_gap_curve)
                              if real_gap_curve else 0.0),
@@ -4340,7 +6271,8 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         while True:
             _rank = _rank_ladder[min(_ladder_i, len(_rank_ladder) - 1)]
             shape = _probe_latent_shape(ref_x=x, pres=pres, batch=B,
-                                        rank=_rank)
+                                        rank=_rank,
+                                        site="engine/_run_cond_probe")
             px = torch.randn(shape, device=x.device, dtype=torch.float32,
                              generator=_probe_gen(x)).to(x.dtype)
             ones = px.new_ones([B])
@@ -4542,10 +6474,15 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                         / (len(pos_all) - 1))
 
         def _pct(arr, p):
-            if not arr:
-                return 0.0
-            a = sorted(arr)
-            return a[min(len(a) - 1, int(p * len(a)))]
+            # The shipped body was `a[min(len(a)-1, int(p*len(a)))]`, which COLLIDES for
+            # n <= 2 (int(0.5*2) == int(0.9*2) == 1, so p90 IS the median -- this is what
+            # made guard_floor a constant 0.075) and is biased at every n (at n = 10 it
+            # returns the maximum for p = 0.9).  Toggle: cfg["pct_derived"].  Counted for
+            # reachability: a toggle wired to nothing looks exactly like one whose effect
+            # is below the noise floor.
+            _pd = bool(cfg.get("pct_derived", False)) if isinstance(cfg, dict) else False
+            _CALIB_AB["pct_derived" if _pd else "pct_shipped"] += 1
+            return _probe_pct(arr, p, derived=_pd)
 
         med_jump = _pct(jumps, 0.5)
         med_curv = _pct(curvs, 0.5)
@@ -4590,6 +6527,14 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                       "A-FloPS cond probe: endgame")
             endgame = _probe_endgame(model, extra_args, x0s[-1], grid[-1],
                                      pos_all, ones, space, _probe_gen(x))
+        # Computed ONCE here so the profile dict below can carry BOTH the curve
+        # and its per-term breakdown without walking the trajectory twice.  The
+        # breakdown matters: measured on the real corpus the probe curve lands
+        # ~10x BELOW the run's (probe p50 0.0000 vs a run p50 of 0.27-0.41), and
+        # the gate is a 4-way AND -- without the per-conjunct pass rates that
+        # failure cannot be attributed to any one term.
+        _cov_r = _lf_rescue_cov_curve(
+            xs, x0s, grid, _eg_n_from_err(_endgame_eg_err(endgame)), 0.0)
         profile = {
             "version": 7,
             "cond_sig": cfg.get("cond_probe_sig"),
@@ -4605,8 +6550,38 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             "med_local_err_real": (_pct(local_errs_real, 0.5)
                                    if local_errs_real else 0.0),
             "curv_curve": [round(v, 6) for v in curvs],
+            # PROBE-SIDE COVERAGE CURVE.  The same statistic the rescue gate
+            # consumes in the run (`frac`), computed along THIS probe trajectory
+            # by the SAME function, so a pitfall like the coverage cliff can be
+            # seen BEFORE sampling rather than diagnosed afterwards.  The probe is
+            # the only instrument that measures the model AND the prompt first.
+            # See NOTES.md and scratch_rescue_cliff_rig.py.
+            "cov_curve": (_cov_r or {}).get("curve"),
+            "cov_curve_terms": (_cov_r or {}).get("terms"),
+            # The DERIVED variant (ref_drop = k*du, k measured from this very
+            # trajectory) alongside the shipped per-step curve.  Both are emitted
+            # so the next real runs can decide which one actually tracks the run:
+            # synthetic fields could not, see scratch_ref_decay_rig.py.
+            "cov_curve_kdu": (_cov_r or {}).get("curve_kdu"),
+            "cov_curve_k": (_cov_r or {}).get("k"),
+            # WHICH probe model-call path ran, and with what arguments.  139 of
+            # 224 profiles are frozen (model returns its input); this is what will
+            # identify the cause on the next frozen run.
+            "probe_call": dict(_PROBE_CALL_DIAG),
+            "cov_curve_meta": _lf_rescue_cov_meta(
+                x0s[-1] if x0s else None, _endgame_eg_err(endgame)),
             "med_jump": med_jump,
             "med_curv": med_curv,
+            # THE PER-ORDER DERIVATIVE SCALE, measured from this very trajectory.  Without it
+            # the derived wmax cap refuses (see _derived_wmax_cap), so this is what lets the
+            # `wmax_bound` arm engage at all.  Omitted orders are ones this grid is too short
+            # to certify, and the cap then falls back rather than guessing.
+            "dk_scale": _measure_dk_scale(x0s, gap_probe),
+            # THE A/B FLAGS THIS PROFILE WAS BUILT UNDER.  `_calib_flags` reads this, and
+            # without it the `wmax_bound` arm was INERT whatever the widget said -- a toggle
+            # wired to nothing, which is indistinguishable from one whose effect is below the
+            # noise floor (the exact trap rule 9 exists for).  `cfg` is in scope here.
+            _CALIB_FLAGS_KEY: _calib_inputs(cfg),
             "med_jump_rel": med_jump_rel,
             "med_detail_abs": med_detail_abs,
             "early_frac": early_frac,
@@ -4619,6 +6594,16 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             "med_local_err": (_pct(local_errs, 0.5) if local_errs else 0.0),
             "guard_sig_med": (_pct(guard_sigs, 0.5) if guard_sigs else 0.0),
             "guard_sig_p90": (_pct(guard_sigs, 0.9) if guard_sigs else 0.0),
+            # BOTH estimators logged whatever the toggle, so one run shows the delta and,
+            # with `n_guard`, whether the p90/med collision is in play for this profile.
+            "guard_sig_med_shipped": (_probe_pct(guard_sigs, 0.5, False)
+                                      if guard_sigs else 0.0),
+            "guard_sig_p90_shipped": (_probe_pct(guard_sigs, 0.9, False)
+                                      if guard_sigs else 0.0),
+            "guard_sig_med_derived": (_probe_pct(guard_sigs, 0.5, True)
+                                      if guard_sigs else 0.0),
+            "guard_sig_p90_derived": (_probe_pct(guard_sigs, 0.9, True)
+                                      if guard_sigs else 0.0),
             "log_gap_probe": gap_probe,
             "log_gap_real": gap_real,
             "gap": gap,
@@ -4646,7 +6631,15 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
 def _apply_cond_probe_profile(cfg, cond_profile, tune, weight, auto_tunable):
     if not cond_profile:
         return
+    cond_profile = _recalibrated(cond_profile, cfg, _derive_cond_calibrations)
     cond_calib = cond_profile.get("calib", {})
+    if cfg.get("_dk_scale") is None:
+        try:
+            _dk = cond_profile.get("dk_scale")
+            if isinstance(_dk, dict) and _dk:
+                cfg["_dk_scale"] = {int(k): float(v) for k, v in _dk.items()}
+        except Exception:
+            pass
     w = max(0.0, min(float(weight), 1.0))
     if w <= 0.0:
         return
@@ -4686,22 +6679,148 @@ def _apply_cond_probe_profile(cfg, cond_profile, tune, weight, auto_tunable):
 
 
 
-def _build_curvature_schedule(profile, steps, denoise=1.0, p=2.0, shift=1.0,
-                              base_sigmas=None):
+def _schedule_weight(curv_val, sig, smax, p=2.0, r=1.0):
+    """Step-density weight of the fine-tune at one sigma.
+
+    w = curv^(1/p) * r^(2*sigma/smax - 1)
+
+    The bias enters as r = f(bias) = 4**(bias-1), i.e. r at the top of the
+    schedule and 1/r at the bottom, so bias=1+d and bias=1-d give EXACT
+    pointwise reciprocal weights (their product is curv^(2/p) at every
+    sigma).  Extracted as a helper so the symmetry rig tests the shipping
+    expression rather than a copy of it.
+    """
+    u = (sig / smax) if smax > 0.0 else sig
+    return (max(float(curv_val), 1e-12) ** (1.0 / p)) * \
+        (float(r) ** (2.0 * u - 1.0))
+
+
+def _warp_frontier(profile, base_sigmas, bias=1.0, p=2.0, coarse=0.01):
+    """Most aggressive SAFE warp for this profile + schedule (auto-warp).
+
+    Criterion -- geometric, not an absolute error budget (rig
+    scratch_safe_warp_rig.py showed that neither a fitted err~curv^a*du^p
+    model nor the probe's gap-scaled local error predicts the engine's
+    per-step error across runs: leave-one-run-out was off by 3-4 orders of
+    magnitude).  What IS measurable, and therefore what gates the search:
+
+      - COVERAGE: every step must stay inside the probe's measured sigma
+        range.  Below the measured floor there is no curvature evidence at
+        all, so that is exactly where "beyond measured" begins.  This is the
+        binding constraint in practice.
+
+    The step-difficulty ratio (worst curv*du^2 vs the user's own schedule) is
+    computed and REPORTED but does not gate: the rig shows it stays within
+    ~0.92-1.10 over the entire sweep, i.e. it carries almost no information.
+    The terminal jump to sigma=0 is excluded (it is not an integrator step).
+
+    Returns (warp_value, info); warp_value = 1.0 (neutral) when nothing below
+    1.0 is safe, the profile is degenerate, or the search fails.
+    """
+    try:
+        _base = [float(v) for v in base_sigmas]
+        if not _base or len(_base) < 5:
+            return 1.0, {"why": "no usable schedule"}
+        curv = profile.get("curv_curve")
+        sigc = profile.get("sigma_curve")
+        if not curv or not sigc or len(curv) < 3 or len(sigc) < 4:
+            return 1.0, {"why": "no curvature evidence"}
+        n = min(len(curv), len(sigc) - 1)
+        anchors = [(float(sigc[k + 1]), max(float(curv[k]), 1e-9))
+                   for k in range(n)]
+        _med_c = sorted(c for _, c in anchors)[len(anchors) // 2]
+        if _med_c < 1e-4:
+            return 1.0, {"why": "degenerate profile"}
+        floor = anchors[-1][0]
+
+        def _curv_at(s):
+            if s >= anchors[0][0]:
+                return anchors[0][1]
+            if s <= anchors[-1][0]:
+                return anchors[-1][1]
+            for (s1, c1), (s2, c2) in zip(anchors, anchors[1:]):
+                if s2 <= s <= s1:
+                    l1, l2 = math.log(s1), math.log(s2)
+                    l = math.log(s)
+                    t = (l - l1) / (l2 - l1) if l2 != l1 else 0.0
+                    return math.exp(math.log(c1)
+                                    + t * (math.log(c2) - math.log(c1)))
+            return anchors[-1][1]
+
+        def _proxy(sig):
+            worst = 0.0
+            below = 0
+            steps = len(sig) - 1
+            for i in range(steps):
+                s, sn = sig[i], sig[i + 1]
+                if sn <= 0.0 or i == steps - 1:
+                    continue
+                du = math.log(s / sn)
+                c = _curv_at(0.5 * (s + sn))
+                worst = max(worst, c * du * du)
+                if sn < floor * 0.999:
+                    below += 1
+            return worst, below
+
+        _n_steps = len(_base) - 1
+        # difficulty diagnostic: reference = the user's OWN schedule
+        ref, _ = _proxy(_base)
+        best = 1.0
+        info = {"worst_ratio": 1.0, "below": 0, "floor": round(floor, 6),
+                "why": "nothing below 1.00 is safe"}
+        w = 1.0
+        while w > 0.0:
+            w = round(w - coarse, 4)
+            if w < 0.0:
+                w = 0.0
+            g = _build_curvature_schedule(profile, _n_steps, 1.0, p=p,
+                                          bias=bias, warp=w, base_sigmas=_base)
+            if g is None:
+                info["why"] = "builder rejected the warped schedule"
+                break
+            sig = [float(v) for v in g.tolist()]
+            worst, below = _proxy(sig)
+            ratio = (worst / ref) if ref > 0.0 else 1.0
+            if below > 0:
+                info["why"] = "coverage: steps below the measured floor"
+                break
+            best = w
+            info = {"worst_ratio": round(ratio, 4), "below": below,
+                    "floor": round(floor, 6), "why": "coverage-limited"}
+        info["safe_range"] = [best, 1.0]
+        return float(best), info
+    except Exception:
+        return 1.0, {"why": "search failed"}
+
+
+def _build_curvature_schedule(profile, steps, denoise=1.0, p=2.0, bias=1.0,
+                              warp=1.0, base_sigmas=None):
     """Fine-tune the user's sigma list with the probe's curvature.
 
     Base math (rig-fitted on CFG5log/CFG1log): the aflops integrator steps in
     u = log(sigma) (its du), so its consistency error is second order in du:
     err ~ C * curv * du^2  (rig: curvature exponent a ~= 0.9 pooled with
     p = 2 fixed by the integrator order).  Equal-error placement therefore
-    uses density ~ curv^(1/p), p = 2 -> sqrt(curv), biased by the user's
-    shift:  (1 + (shift-1)*sigma).
+    uses density ~ curv^(1/p), p = 2 -> sqrt(curv).
 
-    The density lives on the external list's INDEX axis: flat curvature (or
-    a degenerate profile) reproduces the user's list exactly -- the probe
-    only re-allocates steps WITHIN the schedule the user plugged in.  The
-    native-time and log-sigma builds were removed with the Scheduler node
-    (git history keeps them); base_sigmas is the only path.
+    Two elementary knobs, both neutral at 1.0 on a 0.00-2.00 widget, both
+    using the factor f(w) = 4**(w-1) so that w and (2 - w) are exact
+    reciprocals -- equal power in either direction:
+
+      warp  reshapes the SIGMA VALUES with the Mobius flow-shift map
+            (u' = S*u/(1+(S-1)*u) on u = sigma/smax, S = f(warp)).  Endpoints
+            are fixed, S and 1/S are exact inverses (the map is a
+            one-parameter group: T_S . T_S' = T_(S S')), and the resulting
+            step-density profile at w=1+d is the exact reciprocal of the
+            profile at w=1-d.
+      bias  tilts the step DENSITY between the top and the bottom of the
+            schedule: weight = r**(2*sigma/smax - 1) with r = f(bias), i.e. r
+            at the top and 1/r at the bottom -- pointwise exact reciprocals.
+
+    Warp is applied first (it moves the sigma values), then bias re-allocates
+    the steps on the warped axis.  bias = warp = 1.0 gives weight 1 everywhere
+    and the identity map, so the user's list is reproduced exactly -- the
+    probe only ever re-allocates steps WITHIN the schedule plugged in.
 
     Anchor semantics follow the probe source: curv_curve[k] is the curvature
     at sigma_curve[k+1] (not at the interval midpoint).
@@ -4715,7 +6834,6 @@ def _build_curvature_schedule(profile, steps, denoise=1.0, p=2.0, shift=1.0,
         steps = int(steps)
         if steps < 4 or float(denoise) <= 0.0:
             return None
-        shift = max(float(shift), 1e-3)
         n = min(len(curv), len(sigc) - 1)
         anchors = [(float(sigc[k + 1]), max(float(curv[k]), 1e-9))
                    for k in range(n)]
@@ -4756,10 +6874,34 @@ def _build_curvature_schedule(profile, steps, denoise=1.0, p=2.0, shift=1.0,
         _bn = len(_bs) - 1
         # steps is derived from the external list; denoise is the user's
         # list as-is (they slice it with their own nodes).
+        #
+        # ---- knobs: bias + warp, both 1.0 = neutral -----------------------
+        # Unit: f(w) = 4**(w-1), so the widget range [0, 2] spans a factor of
+        # 4 each way and w / (2 - w) are EXACT reciprocals -> +0.5 and -0.5
+        # carry the same amount of power in opposite directions (rig-verified
+        # inverse pairing, see scratch_symmetry_rig.py).
+        _r = 4.0 ** (float(bias) - 1.0)      # density tilt factor
+        _s = 4.0 ** (float(warp) - 1.0)      # sigma-shift factor
+        # warp: Mobius flow-shift on the NORMALIZED schedule, which fixes both
+        # endpoints (sigma = smax and 0 unchanged) and is a one-parameter
+        # group (T_S . T_S' = T_{S S'}), so S and 1/S are exact inverses.
+        if abs(_s - 1.0) > 1e-9:
+            _smax_w = _bs[0] if _bs[0] > 0.0 else 1.0
+            _w = []
+            for _v in _bs:
+                _u = _v / _smax_w
+                _up = _s * _u / (1.0 + (_s - 1.0) * _u)
+                _w.append(round(_up * _smax_w, 6))
+            _w[-1] = _bs[-1]
+            for _i in range(len(_w) - 1):
+                if _w[_i] <= _w[_i + 1]:
+                    return None
+            _bs = _w
         _map = _bs[:-1]          # N boundary sigmas, descending
         _tail = _bs[-1]          # the user's own endpoint (usually 0)
         if _map[0] <= _map[-1] or _map[0] <= 0.0:
             return None
+        _smax = _map[0] if _map[0] > 0.0 else 1.0
 
         def sig_of_u(u):
             f = min(max(float(u), 0.0), float(_bn - 1))
@@ -4771,8 +6913,29 @@ def _build_curvature_schedule(profile, steps, denoise=1.0, p=2.0, shift=1.0,
 
         M = 800
         us = [_bn * (i / M) for i in range(M + 1)]
-        ws = [((curv_at(sig_of_u(u)) ** (1.0 / p))
-               * (1.0 + (shift - 1.0) * sig_of_u(u))) for u in us]
+        ws = [_schedule_weight(curv_at(sig_of_u(u)), sig_of_u(u), _smax,
+                               p, _r) for u in us]
+        # Resolution floor: the fine-tune may add steps where curvature needs
+        # them but must never make any step COARSER than the user's own
+        # schedule.  Output gap = mean(w)/w(u) index units, so enforce
+        # w(u) >= mu via the fixed point mu = mean(max(w, mu)).  Without this
+        # the top-heavy curv^0.5 density starves the low-sigma tail: measured
+        # CFG5 -- last positive sigma 0.132 vs simple's 0.0577, leaving the
+        # image at a higher residual sigma ('not fully resolved').
+        _wmin = min(ws)
+        _wmax = max(ws)
+        if _wmax > _wmin:
+            _lo, _hi = _wmin, _wmax
+            for _ in range(40):
+                _mid = 0.5 * (_lo + _hi)
+                _m = sum(max(v, _mid) for v in ws) / len(ws)
+                if _m < _mid:
+                    _hi = _mid
+                else:
+                    _lo = _mid
+            _mu = 0.5 * (_lo + _hi)
+            if _mu > _wmin:
+                ws = [max(v, _mu) for v in ws]
         cum = [0.0]
         for i in range(1, M + 1):
             cum.append(cum[-1] + 0.5 * (ws[i - 1] + ws[i])
@@ -4804,7 +6967,16 @@ def _build_curvature_schedule(profile, steps, denoise=1.0, p=2.0, shift=1.0,
 
 
 _DWELL_OV_GATE = 0.25     # below this measured oversteer the dwell never arms
-_DWELL_OV_REF = 0.55      # oversteer at which the dwell reaches its cap
+# Oversteer at which the dwell reaches its cap.  Was 0.55, which no run ever
+# reached: the strongest of 31 post-fix runs scored evidence.ov = 0.392, so the
+# knob's top 29% did nothing.  Re-anchored at the measured p90 of the post-fix
+# evidence.ov distribution (0.288), so the strongest decile of real runs attains
+# the _DWELL_CAP ceiling while everything below it scales proportionally.
+# Recorded in NOTES.md; scratch_dwell_calibration_rig.py derives it from the
+# corpus rather than asserting it.  NOTE this is a stepping constant -- it scales
+# how much of a step a pixel withholds -- so the anchor is measured but the
+# visual effect still wants an A/B.
+_DWELL_OV_REF = 0.288     # oversteer at which the dwell reaches its cap (p90)
 _DWELL_CAP = 0.20         # strength ceiling (fraction of a step withheld)
 _DWELL_R_HI = 2.0         # flux ratio (vs image median) at full dwell weight
 _DWELL_EMA = 0.7          # decay of the per-pixel flux envelope
@@ -4818,6 +6990,102 @@ def _dwell_env(kn, ramp_end, fade_start, fade_end):
     t_out = 1.0 - _sstep((float(kn) - float(fade_start)) /
                          max(float(fade_end) - float(fade_start), 1e-6))
     return t_in * t_out
+
+
+# ---------------------------------------------------------------------------
+# Probe-driven lambda clamp.
+#
+# The clamp is a TRUST REGION on the lambda ESTIMATE, not a stability guard.
+# lambda = -1 + <dx0, dx>/||dx||^2 is literally a measurement of how fast the
+# denoiser's x0 is drifting along the step, and the probe measures exactly that
+# quantity (jump_curve).  So where the measured jump is large the estimate is
+# least trustworthy and the bound is pulled to the ANCHOR (lambda = -1, the
+# exact constant-x0 step); where x0 has settled the estimate is informative and
+# the bound relaxes to the headroom below the anchor (today's -3).
+#
+# Measured on the saved corpus: the clamp binds only in the first steps, and
+# the probe's jump curve peaks in exactly that interval (23/27 non-degenerate
+# profiles), decaying monotonically after it.
+# ---------------------------------------------------------------------------
+_LAM_ANCHOR = -1.0        # lambda = -1 is the exact constant-x0 step
+_LAM_HEADROOM = 2.0       # -> the loose end is -3.0, today's default
+
+
+def _recommend_lam_clamp_from_profile(prof_m, prof_c, sigmas):
+    """Per-step lambda LOWER bound, from the probe's measured x0 jump.
+
+    Returns one bound per sigma interval (len(sigmas) - 1 entries), or None
+    when there is no usable evidence -- notably on DISTILLED models, whose
+    measured jump is ~0 (they barely move x0) and so carries no signal; those
+    keep the fixed bound.
+    """
+    try:
+        prof = None
+        for p in (prof_c, prof_m):
+            if (isinstance(p, dict)
+                    and len(p.get("jump_curve") or []) >= 1
+                    and not _probe_degenerate(p)):
+                prof = p
+                break
+        if prof is None:
+            return None
+        jump = [float(v) for v in (prof.get("jump_curve") or [])]
+        sigc = [float(v) for v in (prof.get("sigma_curve") or [])]
+        n = min(len(jump), max(0, len(sigc) - 1))
+        if n < 1:
+            return None
+        jump = jump[:n]
+        sigc = sigc[:n + 1]
+        jmax = max(jump)
+        jmin = min(jump)
+        if jmax <= 0.0:
+            return None                 # distilled: x0 does not move at all
+        jspan = jmax - jmin
+        if jspan < 1e-9:
+            # flat jump curve: no gradient to grade the estimate by, so keep
+            # the fixed bound rather than inventing a difference
+            return None
+        s = [float(v) for v in sigmas]
+        if len(s) < 2:
+            return None
+        out = []
+        for i in range(len(s) - 1):
+            sg = s[i]
+            j = jump[-1]                # below the probed band: bottom interval
+            for k in range(n):          # sigma_curve descends, so the first
+                if sg >= sigc[k + 1]:   # k whose low edge sigma is under sg
+                    j = jump[k]
+                    break
+            # normalise over the SPAN so the largest-jump interval is the anchor
+            # and the smallest is the full headroom -- normalising by max alone
+            # would leave the loose end unreachable unless a jump were exactly 0
+            rel = min(max((j - jmin) / jspan, 0.0), 1.0)
+            out.append(_LAM_ANCHOR - _LAM_HEADROOM * (1.0 - rel))
+        return out
+    except Exception:
+        return None
+
+
+def _run_lam_bound(jump, jump_max):
+    """Causal per-step lambda lower bound from the RUN's own measured x0 jump.
+
+    Preferred over the probe's because, measured against the saved corpus, the
+    probe over-reports the jump by 2-4x on Anima (right shape, 0.93-0.97
+    correlation, wrong magnitude) and reports a flat 0.0 on distilled Krea2
+    where the run's real jump is 0.375 at the top.  This uses the previous
+    step's already-computed x0, so it is available BEFORE the update.
+
+    Normalised by the largest jump seen SO FAR: at the first measured step
+    rel = 1 (the anchor), and because the jump decays monotonically down the
+    schedule on both models the bound relaxes as the run proceeds.
+    """
+    try:
+        if jump is None or jump_max is None or jump_max <= 0.0:
+            return None
+        rel = min(max(float(jump) / float(jump_max), 0.0), 1.0)
+        return _LAM_ANCHOR - _LAM_HEADROOM * (1.0 - rel)
+    except Exception:
+        return None
 
 
 def _recommend_dwell_from_profile(prof_m, prof_c, sigmas, lf_evid,
@@ -4917,12 +7185,94 @@ ENGINE_DEFAULTS = {
     "eta_fade_sigma": -1.0,       # <0 = auto: derived from the probe's conv_sigma
     "eta_fade_floor": 0.25,       # fraction of the baseline eta retained after the late fade
     "wmax_base": 2.0,
+    # DERIVED-CONSTANT A/B ARMS -- see the block above `_derive_calibrations` for the
+    # derivations and the rigs.  Both the shipped and the derived value are logged either way
+    # so a single run shows the delta.
+    #
+    # `pct_derived` DEFAULTS ON because it is a bug fix, not a preference: the shipped
+    # estimator `a[int(p*n)]` makes p90 IDENTICAL to the median for n <= 2, which silently
+    # collapsed guard_floor to its r = 1 value on every Krea cond profile.  Percentiles are
+    # supposed to be percentiles.  Set it False to A/B back to the old behaviour.
+    "pct_derived": True,
+    # `wmax_bound` DEFAULTS OFF because it changes WHICH EXTRAPOLATION ORDERS the engine
+    # accepts -- i.e. the stepping itself -- which is an A/B, not a fix.  It is now
+    # functional: profile["dk_scale"] supplies the per-order derivative scale it requires.
+    "wmax_bound": False,
+    # THE OPERATOR'S NUDGE for the one input to the order bound that is NOT a measurement.
+    # `dk_scale` is measured on the PROBE grid as a trajectory statistic, so it is not a
+    # per-step upper bound (scratch_extrap_remainder_rig.py: 58 of 204 cases under-bound
+    # with the shipping median, up to 578-1807x at individual steps), and the transfer of
+    # that scale to the real grid cannot be verified without spending NFE.  This multiplier
+    # scales ONLY the tolerance the remainder gate compares against -- never `rtol`, which
+    # the corrector also consumes.  1.0 is neutral and bit-identical to no multiplier;
+    # >1 admits higher orders at the same measured error, <1 is more conservative.
+    "wmax_budget": 1.0,
+    # FORCED PER-PIXEL ORDER FLOOR (widget on the Sampler node).  1.0 = shipped behaviour and
+    # bit-identical: the branch below is not entered at all.  Above 1 it RAISES the order the
+    # ladder would otherwise use -- as a DEMAND, never an override: everything downstream
+    # that can refuse an order (the weight cap, and with `wmax_bound` ON the remainder bound)
+    # still applies, so the floor cannot smuggle in an order the evidence rejects; and a pixel
+    # `reset_m` snapped to 1 stays at 1, because that reset is the ladder's own response to
+    # novelty or an anomaly.
+    #
+    # WHY IT EXISTS: the ladder's criterion judges PREDICTION (`ord_innov`, aflops.py:8757),
+    # not USEFULNESS, and on the operator's own model the higher orders predict x0 1.4x-46x
+    # worse than order 1, so the ladder sits at ~1.03 and nothing downstream can move it.
+    # Whether a higher order makes the actual STEP worse is a different question that no
+    # logged field answers -- this knob is what answers it, by forcing the order up and
+    # reading the per-step `err` the engine already records.
+    "order_floor": 1.0,
+    # WHICH CRITERION PICKS THE PER-PIXEL ORDER.  False (shipped) = the innovation argmin,
+    # i.e. "the order whose extrapolation best PREDICTS x0".  True = the per-pixel Lagrange
+    # remainder, i.e. "the HIGHEST order still valid at this pixel's own smoothness" -- the
+    # Runge criterion.  They answer different questions: the first is dominated by pixel-level
+    # noise that the higher orders amplify (weights 1.5 -> 5.41) and settles near order 1 on
+    # real models; the second admits order 6 where the trajectory is smooth and order 1 where
+    # it is not, which is what the operator's intent needs.  See `_pixel_order_bound`.
+    "order_by_bound": False,
     "wmax_adapt": True,
     "wmax_adapt_k": 0.5,
     "wmax_mid_floor": 1.55,
     "s_tmin": 1.0, "s_tmax": 0.0,
     "rtol": 0.01,
     "err_mode": "rel_l2",
+    # CORRECTOR A/B.  True = the current corrector.  False = the
+    # archive-known-good corrector behaviour (see the switch in the step loop).
+    # Default True so existing workflows are unaffected; flip it to compare the
+    # two arms on the same build, same seed, same schedule.
+    "corrector_ab": True,
+    # ORDER A/B.  True = shipped per-pixel adaptive order ladder.  False = force
+    # the pure order-1 exponential integrator (no extrapolation, no 2nd-order
+    # slope).  No single variable could be shown to separate helpful from
+    # harmful order-2 steps (scratch_histcos_gate_rig.py), so this A/Bs the
+    # machinery itself on the real model.
+    "order_ab": True,
+    "euler_cut": True,
+    # DERIVED CONSTANTS -- NOW THE DEFAULT (the A/B is closed).  It was an A/B
+    # (`derived_ab`, default False = shipped hand-set values); the verdict is that the
+    # derived forms replace the hand-set ones, so the switch is gone and this is what
+    # ships.  Each derived form replaces a handwave with a closed form or a measured
+    # crossing: the series switch -> sqrt(12*eps) of the working dtype, the x0m
+    # envelope -> sum|w_i| (the extrapolation's own amplification bound), and the
+    # default rtol -> the measured 1.536e-2 crossing.  Measured consequence of the
+    # switch being ON, so nobody expects more than it delivers: two of the three are
+    # INERT on real runs (the series branches agree below the rounding floor; the
+    # envelope guard only acts when the norm overshoots and it does not on real
+    # trajectories), and only the rtol floor changes anything -- on the 19 of 20
+    # corpus models whose probe rtol sits below the crossing.  Set False only to
+    # reproduce historical (pre-verdict) behaviour.
+    "derived_ab": True,
+    # WHICH QUANTITY THE EULER-SAFETY CUT COMPARES -- ALSO CLOSED, and this one is
+    # the tail fix.  "corrected" = the corrected step vs the plain exact step, which
+    # mixes a term the blend already bounds with the ladder's own move, and where the
+    # ladder contributes nothing evaluates `tol > tol` (a rounding lottery, measured
+    # firing on 3 of 5 step counts).  "midpoint" = the ladder's midpoint vs the plain
+    # step: only the term nothing else bounds.  The verdict is "midpoint", on the
+    # T4 rig (scratch_cut_variable_rig.py, 8/8: 1.44x-1.93x better where the shipped
+    # cut fired, every earlier step bit-identical) and on three real Krea2 pairs where
+    # the shipped cut fired 1-3 times and the derived cut fired NOT ONCE.  Set
+    # "corrected" only to reproduce historical behaviour.
+    "cut_var": "midpoint",
     "grad_strength": 5.0,
     "aflops_lam_min": -3.0,
     "aflops_lam_max": 0.0,
@@ -5032,6 +7382,35 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     cfg = {**ENGINE_DEFAULTS, **(cfg or {})}
     global _LAST_CFG
     extra_args = {} if extra_args is None else extra_args
+    # Each run's A/B reachability record describes THAT run only.  Reset must
+    # happen HERE, at the very top: the rtol site is evaluated before the loop
+    # (and before _LAST_ERRORS.clear below), so resetting later silently erased
+    # its counter -- caught by scratch_ab_reach_rig.py, which is exactly the
+    # class of mistake this instrumentation exists to make visible.
+    _ab_reach_reset()
+    # THE ORDER GATE'S COUNTERS BELONG TO ONE RUN TOO.  They were left cumulative when the
+    # gate shipped, so every run after the first in a ComfyUI session reported the running
+    # TOTAL: measured on the operator's own runs, a run with `wmax_bound=False` reported
+    # `on=107` (carried over from the previous run) while the first run of the session
+    # correctly reported `on=0`.  A counter that answers "did this toggle fire" has to be
+    # per-run or it answers a different question.  scratch_order_gate_smoke_rig.py MISSED
+    # this because the rig zeroed the counters itself before each run -- the harness was
+    # doing the engine's job.  scratch_wmax_bound_onoff_rig.py now checks it from the
+    # CORPUS instead, where no harness can hide it.
+    _ORDER_GATE_AB.update({k: 0 for k in _ORDER_GATE_AB})
+    # A/B experiment switches, applied FIRST -- before anything can compute or
+    # cache a trajectory_state.  This must stay at the top of the function: the
+    # probe block below caches `trajectory_state` (including oversmooth) into
+    # _PROBE_PROFILES, so setting these later made every run use the PREVIOUS
+    # run's mode -- a one-run lag that silently invalidated a 6-run A/B.  See
+    # scratch_oversmooth_ab_rig.py, which asserts this ordering.
+    global _OSM_AB_MODE, _EV_AB_MODE
+    _OSM_AB_MODE = str(cfg.get("_osm_ab_mode", "engine") or "engine")
+    if _OSM_AB_MODE not in ("engine", "reanchored", "off"):
+        _OSM_AB_MODE = "engine"
+    _EV_AB_MODE = str(cfg.get("_ev_ab_mode", "engine") or "engine")
+    if _EV_AB_MODE not in ("engine", "ov_only"):
+        _EV_AB_MODE = "engine"
     _env_fp = os.environ.get("AFLOPS_FOCUSED_PROBE")
     if _env_fp == "0":
         cfg["cond_probe_focused"] = False
@@ -5039,6 +7418,69 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         cfg["cond_probe_focused"] = True
     auto_tunable = {k for k in ENGINE_DEFAULTS
                     if cfg.get(k) == ENGINE_DEFAULTS[k]}
+
+    # ---------------------------------------------------------------------
+    # STANDALONE MODE -- the Autotuner is not connected.
+    #
+    # The Autotuner is what emits `options`, and `options` is what turns the
+    # probes on.  With neither probe enabled there is NO source for the
+    # probe-derived tuning levels, so every subsystem that REQUIRES them must be
+    # switched off explicitly rather than left to fall back on an absolute
+    # ENGINE_DEFAULTS constant.  Measured basis for that rule: absolute
+    # thresholds on measured quantities are unreliable across models (the
+    # documented 2-9x probe inflation), and the Krea2 family alone spans
+    # hit p50 0.346..0.427 across 12 checkpoints while the PROMPT moves the same
+    # quantity ~3x more than the checkpoint does.
+    #
+    # WHAT IS DISABLED, and why each one:
+    #   lf_enable       -- its gains are derived FROM probe evidence; with
+    #                      evidence.source == "none" the field already stood down,
+    #                      so this only makes an implicit behaviour explicit.
+    #   dwell_mode      -- "auto arms only with probe evidence"; same reasoning.
+    #   eta_escape_jump -- "-1.0 = auto: derived from the probe's med_jump_rel".
+    #   eta_fade_sigma  -- "-1.0 = auto: derived from the probe's conv_sigma".
+    #                      Both autocues have NO source standalone.
+    #   probe_tune_*    -- nothing to tune from; turning them off cannot change
+    #                      behaviour but stops a future stale profile from being
+    #                      applied as if it were this run's measurement.
+    #
+    # WHAT IS DELIBERATELY **NOT** DISABLED, because disabling it would be a guess
+    # and this project does not ship guesses: the outlier guard and the anomaly
+    # detector are run-side safety nets.  They stay ON and now run on
+    # ENGINE_DEFAULTS -- which is reported so the operator can SEE that their
+    # thresholds are untuned rather than believing them to be probe-derived.
+    # Whether they misbehave standalone is UNMEASURED (the corpus holds exactly one
+    # standalone run), so they are left alone until there is evidence.
+    _probe_any = bool(cfg.get("probe_enabled")) or bool(cfg.get("cond_probe_enabled"))
+    cfg["_standalone"] = not _probe_any
+    if cfg["_standalone"]:
+        cfg["lf_enable"] = False
+        cfg["dwell_mode"] = "off"
+        cfg["eta_escape_jump"] = 0.0
+        cfg["eta_escape_detail"] = 0.0
+        cfg["eta_fade_sigma"] = 0.0
+        for _tk in ("probe_tune_guard", "probe_tune_tol", "probe_tune_wmax",
+                    "probe_tune_anomaly", "probe_tune_eta", "probe_tune_lf",
+                    "cond_probe_tune_guard", "cond_probe_tune_tol",
+                    "cond_probe_tune_wmax", "cond_probe_tune_anomaly",
+                    "cond_probe_tune_eta", "cond_probe_tune_lf"):
+            cfg[_tk] = False
+        # Recorded so the corpus can tell a standalone run from a probed one by a
+        # POSITIVE field.  Today the only way to identify one is the ABSENCE of
+        # probe_key/_ms_info, which is exactly the kind of implicit signal this
+        # project has been burned by.
+        cfg["_standalone_note"] = (
+            "Autotuner not connected: no probe evidence. Disabled lf_enable, "
+            "dwell_mode, eta_escape_*, eta_fade_sigma, probe_tune_*. The outlier "
+            "guard and anomaly detector stay ON but run on ENGINE_DEFAULTS "
+            "(untuned) thresholds.")
+        if log_errors:
+            logging.info("[A-FloPS] STANDALONE MODE: no Autotuner connected, so no "
+                         "probe evidence exists. Disabled the layers that REQUIRE "
+                         "it: local field (lf_enable), dwell (dwell_mode), the "
+                         "eta escape/fade auto-thresholds, and probe_tune_*. The "
+                         "outlier guard and anomaly detector remain ON, but their "
+                         "thresholds are ENGINE_DEFAULTS, NOT probe-derived.")
     lf_prof_m = None
     lf_prof_c = None
     lf_prof_w = float(cfg.get("cond_probe_weight", 0.5))
@@ -5075,6 +7517,15 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         profile = _PROBE_PROFILES.get(pkey)
         if profile is not None and int(profile.get("version", 1) or 1) < 7:
             profile = None
+        # An EXACT-signature hit is THIS run's own measurement under THIS config,
+        # so it is trusted as-is and suppresses our probe.
+        # Regression fixed here: probe_from_node used to be assigned only on the
+        # FALLBACK branch below, so an exact-key hit left it False and the engine
+        # re-probed on every run.  That is why runs 69-73 of the 68-73 A/B set
+        # came out healthy while run 68, which took the fallback, adopted a stale
+        # DEGENERATE profile and ran the whole generation on zero-dynamics
+        # evidence.
+        probe_from_node = profile is not None
         # Fall back to the most recent profile for this model when the
         # schedule-qualified key misses -- e.g. a profile pre-computed
         # node-side by the Probe Options node BEFORE the KSampler started
@@ -5082,17 +7533,23 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         # the real sigmas by the consumers, exactly like the node-side cond
         # probe).  Without this fallback the engine would re-probe here at
         # sampling time even though the values are already cached.
-        probe_from_node = False
         if profile is None and not bool(cfg.get("probe_force", False)):
             profile = _latest_profile(model)
             if profile is not None and int(profile.get("version", 1) or 1) < 7:
                 profile = None
-            probe_from_node = profile is not None
+            # FALLBACK provenance is unknown, so it only counts as "our probe
+            # already ran" when it can serve the curvature consumers.  Adoption
+            # still happens either way -- the whitepoint / adaptive-noise
+            # consumers want it -- but a too-short OR DEGENERATE profile must
+            # never suppress our own measurement.
+            probe_from_node = (profile is not None
+                               and _profile_serves_model_probe(profile))
             if probe_from_node and log_errors:
                 logging.info("[A-FloPS-probe] using pre-computed profile "
                              "(node-side probe ran before the KSampler; "
                              "skip sampling-time probe)")
-        if profile is None or bool(cfg.get("probe_force", False)):
+        if (profile is None or not probe_from_node
+                or bool(cfg.get("probe_force", False))):
             if log_errors:
                 logging.info("[A-FloPS-probe] running pre-profile pass "
                              "(%d steps @ %dx%d latent)",
@@ -5104,8 +7561,12 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                       "A-FloPS model probe")
             _probe_model_cache_guard(model, True)
             try:
-                profile = _run_probe(model, x, sigmas, extra_args, cfg,
-                                     callback=callback)
+                _adopted_prof = profile
+                _fresh = _run_probe(model, x, sigmas, extra_args, cfg,
+                                    callback=callback)
+                # Never lose evidence a previous build kept: if our own probe
+                # produced nothing, fall back to the adopted profile.
+                profile = _fresh if _fresh is not None else _adopted_prof
             finally:
                 _probe_model_cache_guard(model, False)
             _progress(callback, "probe", "end",
@@ -5371,6 +7832,103 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     order = order_cap
     hist_cap = max(8, order_cap) if adaptive_on else 8
     corrector = "aflops"
+    # ---- CORRECTOR A/B ------------------------------------------------------
+    # True (default)  = the current engine's corrector.
+    # False           = the ARCHIVE-known-good corrector behaviour, from
+    #                   `_antique/comfyui-research-samplers/old/8/aflops - cfg5
+    #                   works properly.py`, whose `_aflops_step` body is the same
+    #                   formula (only the return arity differs).  The three
+    #                   differences this switch reverts:
+    #                     1. the integrator is fed `x0`      instead of `x0m`
+    #                        (archive line 6861  vs  current line 7811)
+    #                     2. the per-step run-driven lambda bound
+    #                        (`_run_lam_bound`) is NOT applied
+    #                     3. the corrected step is ALWAYS taken -- no blend
+    #                        toward the midpoint and no Euler-safety cut to x1
+    #                   With it False, `corr` can never read "raw", which is
+    #                   itself the fingerprint that the OLD arm ran.
+    #
+    #                   NOT a probe-cache key.  `_aflops_step` has exactly ONE
+    #                   call site (the step loop), and no probe function calls
+    #                   it -- probes advance with `exact_step` only.  So the
+    #                   probe MEASUREMENT is arm-independent and a shared cached
+    #                   probe is correct, not a leak.  The arm is recorded in
+    #                   `_LAST_CFG` and in every step's `corr`, so a run's
+    #                   label can never contradict its evidence.
+    corrector_ab = bool(cfg.get("corrector_ab", True))
+    # ---- ORDER / EXTRAPOLATION A/B -----------------------------------------
+    # True (default) = the shipped per-pixel adaptive order ladder.
+    # False          = force the PURE ORDER-1 exponential integrator: no midpoint
+    #                  extrapolation (x0m stays x0), no 2nd-order slope term, and
+    #                  x_pred = x1.  That is the paper's A-Euler step with the
+    #                  adaptive lambda and nothing on top.
+    #
+    # WHY THIS TOGGLE EXISTS (measured, not assumed):
+    # `scratch_histcos_gate_rig.py` measured, on a denoiser with sigma-scaled
+    # estimation error, 58 step instances where the order-2 step landed CLOSER to
+    # the ideal trajectory and 26 where it landed FARTHER -- and NO single
+    # variable separates the two groups (du: helps up to 0.551, hurts from 0.028;
+    # wmax: 1.98 vs 0.00; hist_cos: 0.023 vs 0.907).  So a threshold on any one
+    # of them cannot be derived, and the honest move is to A/B the machinery
+    # itself on the real model: if forcing order 1 changes the tail artifacts,
+    # the extrapolation is the culprit; if not, it is not.
+    #
+    # In the real logs the gate releases the ladder for the first time at step 10
+    # (hist_cos flips positive) at the LARGEST du, and that first-ever order-2
+    # step overshoots: err/tol 2.0x then 6.8x, cut to 'raw' on the ON arm.
+    order_ab = bool(cfg.get("order_ab", True))
+    # ---- EULER-SAFETY CUT ARM (T2) -----------------------------------------
+    # True (default) = shipped: when the corrected step departs from the plain
+    #                  exact step by more than `tol`, replace it with the plain
+    #                  step.  False = keep the corrected step unconditionally.
+    # Added ONLY so the tail question can be measured as a controlled arm
+    # (scratch_tail_three_arm_rig.py); the default is byte-identical to the
+    # shipped behaviour, which the rig asserts before it reports anything.
+    euler_cut = bool(cfg.get("euler_cut", True))
+    # ---- WHICH VARIABLE THE EULER-SAFETY CUT TESTS (T4) ---------------------
+    # "corrected" (default) = shipped: compares the CORRECTED step to the plain
+    #                         step, which the blend's own bound is a component of.
+    # "midpoint"            = the derived form: compares the LADDER's midpoint step
+    #                         to the plain step, i.e. tests only the term nothing
+    #                         else bounds.  See the long derivation at the cut.
+    cut_var = str(cfg.get("cut_var", "midpoint") or "midpoint")
+    if cut_var not in ("corrected", "midpoint"):
+        cut_var = "midpoint"
+    # ---- DERIVED-CONSTANTS A/B ---------------------------------------------
+    # False (default) = the SHIPPED hand-set values, so nothing changes unless
+    #                   this is switched on.
+    # True            = the DERIVED forms, each of which replaced a handwave with
+    #                   either a closed form or a measured crossing:
+    #
+    #   1. the `1e-4` series switch -> `sqrt(12*eps)` of the working dtype.
+    #      DERIVED in scratch_step_constants_rig.py: the truncated Taylor branch's
+    #      dominant relative error is the phi2 term z^2/12, verified numerically
+    #      (law/series ratio 0.997..1.001 over z = 1e-5..1e-2), so the switch
+    #      belongs where that error meets the precision: 1.196e-3 for float32,
+    #      5.162e-8 for float64.  The shipped 1e-4 is 12x conservative for f32 and
+    #      1937x too large for f64.  (Effect is tiny; included for correctness.)
+    #
+    #   2. the `_AFLOPS_X0M_ENV = 1.3` envelope -> `sum|w_i|`, the extrapolation's
+    #      OWN exact amplification bound.  DERIVED in scratch_x0m_env_rig.py: x0m
+    #      is a Lagrange combination with sum(w) = 1 (verified, max|sum(w)-1| =
+    #      3.6e-15), so ||x0m|| <= (sum|w_i|)*max||x0_i||.  Over 2094 real
+    #      (order, geometry) situations sum|w| has median 4.459 and exceeds 1.3 in
+    #      100% of them, by 1.42x at order 2 rising to 17.6x at order 10.  So the
+    #      fixed 1.3 is near-correct only at order 2 and drifts with the order for
+    #      reasons unrelated to the data.  (Fires on 7.4% of extrapolations.)
+    #
+    #   3. `rtol` -> 1.536e-2, the crossing MEASURED in scratch_rtol_derive_rig.py:
+    #      the value of |step2 - x1| at which the 2nd-order correction stops
+    #      landing closer to the ideal than the plain step.  Below it keep the
+    #      correction, above it cut.  The shipped standalone default 0.01 sits
+    #      BELOW that crossing, so it cuts early across the band between them.
+    #      Only applied when the probe has NOT supplied a tolerance.
+    #
+    # MEASUREMENT PROTOCOL, and it is mandatory (NOTES.md): hold the PROMPT FIXED
+    # across arms.  Prompt choice moves err/tol by a median 41% against a 6%
+    # run-to-run floor, so a prompt-varying A/B cannot resolve this.
+    derived_ab = bool(cfg.get("derived_ab", True))
+    _DERIVED_RTOL = 1.536e-2
     err_mode = cfg["err_mode"]
     grad_strength = float(cfg.get("grad_strength", 5.0))
     noise_space = cfg["noise_space"]
@@ -5388,6 +7946,13 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     wmax_mid_floor = float(cfg.get("wmax_mid_floor", 1.55))
     wmax_adapt_k = float(cfg.get("wmax_adapt_k", 0.5))
     wmax_limit = wmax_base
+    # the forced per-pixel order floor (see ENGINE_DEFAULTS): read once per run, not per step
+    _order_floor = float(cfg.get("order_floor", 1.0) or 1.0)
+    # which criterion picks the per-pixel order, and the tolerance the remainder bound is
+    # compared against -- the SAME tolerance the order gate uses, so the two agree
+    _order_by_bound = bool(cfg.get("order_by_bound", False))
+    _order_tol = float(cfg.get("rtol", 0.01) or 0.01) * max(
+        float(cfg.get("wmax_budget", 1.0) or 1.0), 1e-6)
     an_enable = bool(cfg["an_enable"])
     an_from = float(cfg["an_from"])
     an_win = int(cfg["an_win"])
@@ -5401,6 +7966,25 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     an_sustain = float(cfg.get("an_sustain_mult", 3.0))
     lf_feed = bool(cfg.get("lf_guard_feed", True))
     n_cand = len(sigmas) - 1
+    # ---- probe-driven lambda clamp ---------------------------------------
+    # The clamp is a trust region on the lambda ESTIMATE (see the helper
+    # above).  An explicit non-default TESTING choice wins, so the A/B toggle
+    # still behaves exactly as labelled.
+    # The clamp is always probe-driven now: the A/B mode widget was removed
+    # once 'auto' proved to be the right setting, so nothing can write a fixed
+    # aflops_lam_min/max any more.
+    _lam_min_steps = None
+    # largest x0 jump seen so far this run, for the causal run-driven bound
+    _run_jump_max = 0.0
+    if bool(cfg.get("lam_clamp_from_probe", True)):
+        _lam_min_steps = _recommend_lam_clamp_from_profile(
+            lf_prof_m, lf_prof_c, sigmas)
+        if _lam_min_steps is not None:
+            logging.info("[A-FloPS] probe-driven lam clamp: per-step lower "
+                         "bound %.2f .. %.2f (anchor %.2f, headroom %.2f); "
+                         "distilled/no-evidence models keep the fixed bound",
+                         min(_lam_min_steps), max(_lam_min_steps),
+                         _LAM_ANCHOR, _LAM_HEADROOM)
     lf_auto_g, lf_evid = _lf_auto_gains(lf_prof_m, lf_prof_c, lf_prof_w,
                                         n_cand, sigmas=sigmas, cfg=cfg)
     lf_gains = None
@@ -5650,6 +8234,26 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     s_min_n = float(pos[-1]) if len(pos) > 0 else 1e-8
     calls = 0
     tol = max(float(cfg.get("rtol", 0.05)), 1e-3)
+    # A/B #3: a FLOOR at the measured crossing.
+    #
+    # MY FIRST VERSION OF THIS WAS A NO-OP ON EVERY PROBED RUN, and the corpus
+    # proved it: it substituted the crossing only when `tol` still equalled
+    # ENGINE_DEFAULTS["rtol"] = 0.01, but with the Autotuner connected `rtol` is
+    # probe-derived and the observed values were 0.014 / 0.0148 / 0.0162 / 0.0169
+    # / 0.0087 -- never 0.01.  Five derived_ab A/B pairs on five models came back
+    # with ZERO differing per-step fields, which is how it was caught.
+    #
+    # The measurement says the shipped default is 1.536x too tight, so the honest
+    # generalisation is a FLOOR at the crossing rather than a swap of one
+    # hard-coded value for another: any tolerance below the crossing is raised to
+    # it, and anything already above is left alone.
+    if derived_ab:
+        _ab_hit("rtol.checked", float(tol))
+        if tol < _DERIVED_RTOL:
+            _ab_hit("rtol.fired", float(tol))
+            tol = _DERIVED_RTOL
+        else:
+            _ab_hit("rtol.already_above", float(tol))
     space_sum = {"log_sigma": 0.0, "sigma": 0.0}
     space_locked = None if space_mode == "auto" else space_mode
     hist = []
@@ -5659,7 +8263,87 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     prev_err = None
     prev_cons = None
     _LAST_ERRORS.clear()
+    # Full-precision identity of the schedule this run actually consumed, plus
+    # the seed.  Without both, two runs cannot be shown to be comparable at
+    # all: the per-step sigma column is rounded to 6dp and _ms_info.sigmas_in
+    # (the autotuner's INPUT) to 5dp, so schedules differing below those
+    # precisions look identical in the log even though the model amplifies the
+    # difference into a visibly different image within two steps.  Measured in
+    # DEAD_FEATURES.md section 13; see _sigmas_digest for the specific case
+    # that made this necessary.
+    _sig_digest = _sigmas_digest(sigmas)
+    try:
+        _seed_val = int(extra_args.get("seed"))
+    except (TypeError, ValueError):
+        _seed_val = None
     _LAST_CFG = {"mode": "aflops",
+                 "_build": _BUILD,
+                 # STANDALONE PROVENANCE.  Without a positive field, a standalone
+                 # run can only be identified by the ABSENCE of probe_key /
+                 # _ms_info -- an implicit signal, which is the kind this project
+                 # has repeatedly been burned by.  Stamped here so the corpus
+                 # states it outright, and so it survives into the saved log.
+                 "_standalone": bool(cfg.get("_standalone", False)),
+                 "_standalone_note": cfg.get("_standalone_note"),
+                 "seed": _seed_val,
+                 # A/B provenance: which experiment arm this run was.
+                 "_osm_ab_mode": _OSM_AB_MODE,
+                 "_ev_ab_mode": _EV_AB_MODE,
+                 # CORRECTOR ARM.  True = current corrector, False = the
+                 # archive-known-good corrector.  Stamped explicitly so a run's
+                 # label can never contradict its evidence; the second
+                 # fingerprint is per-step `corr`, which can only read "raw" on
+                 # the True arm.
+                 "corrector_ab": bool(corrector_ab),
+                 # ORDER ARM.  True = adaptive order ladder, False = forced
+                 # order 1.  Per-step `eff_cap`/`order` in the log is the second
+                 # fingerprint: forced order 1 leaves eff_cap == 1 everywhere.
+                 "order_ab": bool(order_ab),
+                 # EULER-SAFETY CUT ARM: True = shipped (cut when the corrected
+                 # step departs from the plain step by more than tol), False =
+                 # keep the corrected step.  Per-step fingerprint is `corr`,
+                 # which can only read "raw" when this is True.
+                 "euler_cut": bool(euler_cut),
+                 # WHICH VARIABLE THE CUT TESTS.  "corrected" = shipped (corrected
+                 # step vs plain step); "midpoint" = derived (ladder midpoint vs
+                 # plain step, the term the blend does not already bound).
+                 "cut_var": str(cut_var),
+                 # DERIVED CONSTANTS ARM.  True = the derived forms of the series
+                 # switch, the x0m envelope and the default rtol; False = shipped.
+                 "derived_ab": bool(derived_ab),
+                 # WHICH A/B PATHS ACTUALLY FIRED.  A flag wired to nothing is
+                 # indistinguishable from a flag whose effect is below the noise
+                 # floor, and that ambiguity already cost two rounds of dead A/B
+                 # runs (five model pairs, zero differing fields).  Stamped as the
+                 # final snapshot after the loop so the log states it outright.
+                 # See `_ab_hit` / scratch_ab_reach_rig.py.
+                 "ab_reach": _ab_reach_snapshot(),
+                 "sigmas_digest": _sig_digest,
+                 # The EFFECTIVE lambda clamp, so a log self-describes which
+                 # clamp produced it.  Previously this had to be inferred from
+                 # the lambda values, which is ambiguous: lambda > 0 is legal
+                 # under [-1,1] but not under [-3,0].
+                 "aflops_lam_min": (cfg.get("aflops_lam_min")
+                                    if cfg.get("aflops_lam_min") is not None
+                                    else _AFLOPS_LAM_MIN),
+                 "aflops_lam_max": (cfg.get("aflops_lam_max")
+                                    if cfg.get("aflops_lam_max") is not None
+                                    else _AFLOPS_LAM_MAX),
+                 "_lam_clamp_always_auto": True,
+                 "lam_clamp_from_probe": bool(_lam_min_steps is not None),
+                 "lam_clamp_probe_range": ([round(min(_lam_min_steps), 4),
+                                            round(max(_lam_min_steps), 4)]
+                                           if _lam_min_steps else None),
+                 # the rule's actual per-step output, so a log shows what it
+                 # chose rather than only the range it spanned
+                 "lam_clamp_probe_bounds": ([round(v, 4) for v in _lam_min_steps]
+                                            if _lam_min_steps else None),
+                 # The autotuner's schedule decision and the bias/warp widgets
+                 # that produced it.  Without this a warp/bias A/B cannot be
+                 # attributed from the logs at all -- the sigma grid identifies
+                 # the PROMPT (the schedule is curvature-driven), not the knob.
+                 "_shift_schedule_node": cfg.get("_shift_schedule_node"),
+                 "_ms_info": cfg.get("_ms_info"),
                  "order": order, "order_cap": order_cap,
                  "adaptive_order": adaptive_on,
                  "ladder_auto": ladder_auto,
@@ -5865,6 +8549,24 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         lf_m = lf_rho = None
         lf_diag = None
         lf_cum_next = None
+        # Measured convergence point of the trajectory (probe profile).  Used
+        # to gate refresh-noise injection: below it the model has no movement
+        # left, so injected noise is not integrated away -- it survives to the
+        # output.  Rigged from CFG1 (distilled): the rescue applied a refresh
+        # to 38% of pixels (rho 0.0155) on the penultimate step whose
+        # sigma_next == conv_sigma == 0.173927, and the terminal step only
+        # re-predicts x0, so the noise landed in the image -- a plain
+        # simple+euler run injects nothing there.
+        _conv_sigma = None
+        for _pf in (lf_prof_c, lf_prof_m):
+            if isinstance(_pf, dict):
+                _cv = _pf.get("conv_sigma")
+                try:
+                    if _cv is not None and float(_cv) > 0.0:
+                        _conv_sigma = float(_cv)
+                        break
+                except (TypeError, ValueError):
+                    continue
         if lf_on:
             _kn = k / n_cand
             if lf_damp is not None:
@@ -5953,6 +8655,15 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                                  "hit": lf_resc.get("hit", 0.0),
                                  "lf_share": lf_resc.get("lf_share", 0.0)}
                                 if lf_resc is not None else 0.0),
+                       # The block size the rescue actually measured with, and the
+                       # latent it measured on.  `_lf_block_for` returns 4 at
+                       # 128x128 -- the old hardcoded value -- so these two fields
+                       # are how a later reader VERIFIES from the corpus that the
+                       # scale-free rule changed nothing at the operator's usual
+                       # resolution, instead of taking that on trust.
+                       "blk": _lf_block_for(jmap) if jmap is not None else None,
+                       "latent": ([int(x.shape[-2]), int(x.shape[-1])]
+                                  if x is not None else None),
                        "drift_p90": (round(float(lf_cum_next.abs()
                                                   .quantile(0.9)), 4)
                                      if lf_cum_next is not None else 0.0),
@@ -5969,6 +8680,12 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         eff_cap = max(1, min(order_cap, len(hist)))
         if guard_active:
             eff_cap = min(eff_cap, 1)
+        # ORDER A/B: force the pure order-1 exponential integrator.  Placed after
+        # every other eff_cap decision so it is unconditional when off.
+        if not order_ab:
+            _ab_hit("order.forced_to_1")
+            eff_cap = 1
+        _ab_hit_max("order.eff_cap_pre_gate", eff_cap)
         hist_cos_val = None
         if (bool(cfg.get("history_consistency_gate", True))
                 and len(hist) >= 2 and eff_cap >= 2 and s2 > 1e-8):
@@ -5997,6 +8714,29 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         eff = 1
         wmax = 0.0
         x0m = x0
+        # The remainder gate's own record for this step (None when the arm is off, when
+        # the order's scale was unmeasured, or when no order was admitted at all).
+        _wgate_info = None
+        # WHY THE ORDER SITS WHERE IT SITS.  `ord_mean`/`ord_max` are measured AFTER the
+        # allowed-ladder maps the pixel's request down to the highest admitted order, so
+        # they cannot distinguish "the criterion asked for 1" from "the criterion asked
+        # higher and the cap clamped it" -- two completely different defects with two
+        # completely different fixes.  These separate them and are TELEMETRY ONLY:
+        # read-only reductions of tensors that already exist, assigned to locals that
+        # nothing but the log record reads.
+        #   ord_want   mean per-pixel order the CRITERION requested (before the clamp)
+        #   ord_pstar  mean of p_star, the order whose extrapolation best predicts x0
+        #   ord_innov  mean per-order innovation, orders 1..min(P,5) -- the curve whose
+        #              argmin IS p_star, so it says which order the criterion prefers
+        _ord_want = None
+        _ord_ps = None
+        _ord_innov = None
+        # the Runge criterion's own record: for each order the per-pixel bound's mean and the
+        # fraction of pixels it ADMITTED -- the spatial spread that is the whole point
+        _ord_bound = None
+        # how many pixels the forced order floor actually raised this step (rule 9: a knob
+        # that cannot show it fired is indistinguishable from one wired to nothing)
+        _ord_floor_n = None
         if eff_cap >= 2 and s2 > 1e-8 and len(hist) >= 1:
             u2_log = math.log(max(s2, 1e-8))
             u2_sig = s2
@@ -6006,7 +8746,10 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 _lim2 = max(wmax_limit, wmax_mid_floor)
                 for ce in range(eff_cap, 1, -1):
                     c_log = _mid_x0(pts_log, 0.5 * (u_log + u2_log), ce)
-                    if c_log[1] > (_lim2 if ce == 2 else wmax_limit):
+                    _ok_ce, _gi_ce = _order_gate(
+                        pts_log, 0.5 * (u_log + u2_log), ce, c_log[1],
+                        (_lim2 if ce == 2 else wmax_limit), cfg)
+                    if not _ok_ce:
                         continue
                     if k >= 2:
                         c_sig = _mid_x0(pts_sig, 0.5 * (s + u2_sig), ce)
@@ -6017,6 +8760,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                             exact_step(x, c_sig[0], s, s2), x1, err_mode,
                             x0_ref=x0, strength=grad_strength)
                     x0m, wmax, eff = c_log[0], c_log[1], ce
+                    _wgate_info = _gi_ce
                     break
                 if eff >= 2 and k >= 5:
                     space_locked = min(space_sum, key=space_sum.get)
@@ -6029,8 +8773,12 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 _lim2 = max(wmax_limit, wmax_mid_floor)
                 for ce in range(eff_cap, 1, -1):
                     cand = _mid_x0(pts, 0.5 * (u_i + u_n), ce)
-                    if cand[1] <= (_lim2 if ce == 2 else wmax_limit):
+                    _ok_ce, _gi_ce = _order_gate(
+                        pts, 0.5 * (u_i + u_n), ce, cand[1],
+                        (_lim2 if ce == 2 else wmax_limit), cfg)
+                    if _ok_ce:
                         x0m, wmax, eff = cand[0], cand[1], ce
+                        _wgate_info = _gi_ce
                         break
         blend_w_mean = None
         ord_tel = None
@@ -6064,14 +8812,20 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             cands = [x0]
             allowed = [True]
             wlevs = [0.0]
+            winfo = [None]
             for ce in range(2, eff_cap + 1):
                 c, wv = _mid_x0(pts_w, u_mid_w, ce)
                 cands.append(c)
                 wlevs.append(wv)
-                allowed.append(wv <= (_lim2 if ce == 2 else wmax_limit))
+                _ok_ce, _gi_ce = _order_gate(pts_w, u_mid_w, ce, wv,
+                                             (_lim2 if ce == 2 else wmax_limit), cfg)
+                allowed.append(_ok_ce)
+                winfo.append(_gi_ce)
             _max_ord = eff_cap
             while _max_ord > 1 and not allowed[_max_ord - 1]:
                 _max_ord -= 1
+            if _max_ord >= 2:
+                _wgate_info = winfo[_max_ord - 1]
             wmax = max(wlevs[1:_max_ord]) if _max_ord >= 2 else 0.0
             P = min(len(hist), order_cap)
             I_list = _pixel_innovations(pts_w[:-1], u_w, x0, P)
@@ -6149,6 +8903,25 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                     o_new = torch.where(
                         reset_m, torch.ones_like(o),
                         (o + move).clamp(1.0, float(max(P, 2))))
+                    # THE RUNGE CRITERION (`order_by_bound`), when it is the arm in force:
+                    # replace "the order that best predicts x0" with "the HIGHEST order whose
+                    # remainder is still inside tolerance at THIS pixel's smoothness".  It
+                    # composes with the safety path -- `allowed` is passed in, so an order this
+                    # step refuses for everyone is refused here too -- and a pixel the ladder
+                    # reset stays at 1, because a reset is a response to novelty/anomaly.
+                    if _order_by_bound:
+                        _ob, _obi = _pixel_order_bound(
+                            pts_w, u_mid_w, abs(u2_w - u_w), allowed, _order_tol)
+                        if _ob is not None:
+                            o_new = torch.where(reset_m, torch.ones_like(o_new), _ob)
+                            _ord_bound = _obi
+                    try:
+                        _ord_want = float(o_new.mean())
+                        _ord_ps = float(p_star.mean())
+                        _ord_innov = [round(float(Iema[q].mean()), 8)
+                                      for q in range(min(int(P), 5))]
+                    except Exception:
+                        _ord_want = _ord_ps = _ord_innov = None
                 else:
                     I_o = (Im * (idxT == (o - 1.0).unsqueeze(0))).sum(0)
                     I_lo = (Im * (idxT == (o - 2.0).clamp_min(0.0)
@@ -6166,6 +8939,19 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                                                                 o + 1.0, o)))
             else:
                 o_new = torch.where(reset_m, torch.ones_like(o), o)
+            # THE FORCED ORDER FLOOR.  Applied AFTER the ladder's own choice and in BOTH
+            # branches, before the allowed-ladder maps anything down -- so it is a demand
+            # that the safety path can still refuse, not an override.  A pixel `reset_m`
+            # snapped to 1 stays at 1.
+            if _order_floor > 1.0:
+                try:
+                    _fl = torch.full_like(o_new, min(float(_order_floor),
+                                                     float(max(P, 2))))
+                    _ord_floor_n = int(((o_new < _fl) & ~reset_m).sum())
+                    o_new = torch.where(reset_m, torch.ones_like(o_new),
+                                        torch.maximum(o_new, _fl))
+                except Exception:
+                    _ord_floor_n = None
             ord_px = o_new
             ladder_ran = True
             arm = []
@@ -6230,7 +9016,10 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                          for h in hist] + [(_bu_i, x0)]
                 _bmid = 0.5 * (_bu_i + _bu_n)
             _c_o2 = _mid_x0(_bpts, _bmid, 2)
-            if _c_o2[1] <= max(wmax_limit, wmax_mid_floor):
+            _ok_o2, _gi_o2 = _order_gate(_bpts, _bmid, 2, _c_o2[1],
+                                         max(wmax_limit, wmax_mid_floor), cfg)
+            if _ok_o2:
+                _wgate_info = _gi_o2
                 _x0m_o2 = _c_o2[0]
                 _bd1 = (x0.float() - hist[-1][2].float())
                 _bd2 = (hist[-1][2].float() - hist[-2][2].float())
@@ -6249,13 +9038,41 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         if not ladder_ran and lf_suppress is not None:
             lf_suppress = _ORD_EMA * lf_suppress
         if eff >= 2:
-            _x0m_env = (_AFLOPS_X0M_ENV
-                        if cfg.get("x0m_env") is None
-                        else float(cfg["x0m_env"]))
+            # A/B #2: the envelope multiplier.  Shipped = the fixed 1.3; derived =
+            # `sum|w_i|`, the extrapolation's own exact amplification bound.
+            _ab_hit("env.eff_ge_2")
+            if derived_ab:
+                _ab_hit("env.derived_arm")
+                try:
+                    _us = [h[0] for h in hist[-(eff - 1):]] + [u_log]
+                    _u2e = math.log(max(s2, 1e-8))
+                    _we = _lagrange_weights(_us, 0.5 * (u_log + _u2e))
+                    _x0m_env = max(sum(abs(w) for w in _we), 1.0)
+                except Exception:
+                    _x0m_env = _AFLOPS_X0M_ENV
+                _ab_hit("env.derived_value", round(float(_x0m_env), 4))
+            else:
+                _x0m_env = (_AFLOPS_X0M_ENV
+                            if cfg.get("x0m_env") is None
+                            else float(cfg["x0m_env"]))
             _env_list = [h[2] for h in hist[-(eff + 1):]] + [x0]
-            _env = _x0m_env * torch.stack(
+            _max_norm = torch.stack(
                 [t.float().norm() for t in _env_list]).max()
+            _env = _x0m_env * _max_norm
             _over = x0m.float().norm() > _env
+            _n_over = int(_over.sum())
+            _ab_hit("env.guard_evaluated")
+            # The guard's own decision variable, normalised so it is comparable
+            # across the two arms: the guard fires exactly when this ratio
+            # exceeds the envelope multiplier in use (1.3 shipped, sum|w| derived).
+            try:
+                _ab_hit_max("env.ratio_vs_maxnorm",
+                            round(float(x0m.float().norm()
+                                        / _max_norm.clamp_min(1e-12)), 4))
+            except Exception:
+                pass
+            if _n_over > 0:
+                _ab_hit("env.guard_fired_pixels", _n_over)
             x0m = torch.where(_over, x0.float(), x0m.float())
         x_pred = exact_step(x, x0m, s, s2) if eff >= 2 else x1
         err = _err_norm(x_pred, x1, err_mode, x0_ref=x0,
@@ -6273,16 +9090,65 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                         .clamp(_GATE_FLOOR, 1.0)
                     lf_gate = torch.where(_nst > 0, _cand, _base)
         corr_used = None
+        # T2c diagnostics MUST be initialised BEFORE the corrector block below,
+        # not after it: an earlier version of this instrumentation reset them in the
+        # `cerr = None` block that FOLLOWS the corrector, which wiped the blend
+        # weight before it could be logged and made `corr_w` read None on every
+        # step -- a value that looked like evidence and was an artefact.
+        _corr_w_used = None
+        _e_pred_used = None
+        _e_raw_used = None
         aflops_lam = None
+        aflops_lam_raw = None
+        _lam_lo = None
+        _lam_src = None
         if s2 > 1e-8:
             # The residual integrator consumes the order-ladder midpoint (x0m),
             # not the raw x0 -- this is what feeds the per-pixel adaptive order
             # into the actual step.  When the ladder is gated (eff_cap == 1) x0m
             # is x0, so the plain 1st-order path is unchanged.
-            aflops_out, aflops_lam = _aflops_step(
-                x, x0m, hist, s, s2, order=eff_cap,
-                lam_min=cfg.get("aflops_lam_min"),
-                lam_max=cfg.get("aflops_lam_max"))
+            # probe-driven per-step lower bound when the probe had usable
+            # evidence, else the fixed cfg bound (incl. the TESTING toggle)
+            _lam_lo = cfg.get("aflops_lam_min")
+            if _lam_min_steps is not None and i < len(_lam_min_steps):
+                _lam_lo = _lam_min_steps[i]
+            _lam_src = "fixed"
+            if _lam_min_steps is not None:
+                _lam_src = "probe"
+            # RUN-driven bound wins over both: it uses the step's OWN measured
+            # x0 jump (already computed above, so it is causal), which is the
+            # real quantity the probe only approximates.
+            # A/B: the archive-known-good corrector (corrector_ab False) did not
+            # have this run-driven per-step bound at all.
+            if (corrector_ab and len(hist) >= 1
+                    and bool(cfg.get("lam_clamp_from_run", True))):
+                try:
+                    _rj = float((x0.float()
+                                 - hist[-1][2].float()).pow(2).mean().sqrt())
+                    if _rj > _run_jump_max:
+                        _run_jump_max = _rj
+                    _rb = _run_lam_bound(_rj, _run_jump_max)
+                    if _rb is not None:
+                        _lam_lo = _rb
+                        _lam_src = "run"
+                except Exception:
+                    pass
+            # A/B #1: what the integrator is FED.  The archive-known-good
+            # corrector used the raw x0 (`_aflops_step(x, x0, ...)`, archive
+            # line 6861) and used the extrapolated x0m only for the predictor
+            # x_pred.  Measured on non-degenerate ground truth
+            # (scratch_corrector_budget_rig.py section E) feeding x0 beats
+            # feeding x0m at 4/4 extrapolation orders.
+            _x0_fed = x0m if corrector_ab else x0
+            _ab_hit("corr.x0_fed_x0m" if corrector_ab else "corr.x0_fed_raw")
+            if corrector_ab and _lam_src == "run":
+                _ab_hit("corr.run_lam_bound")
+            aflops_out, aflops_lam, aflops_lam_raw = _aflops_step(
+                x, _x0_fed, hist, s, s2, order=eff_cap,
+                lam_min=_lam_lo,
+                lam_max=cfg.get("aflops_lam_max"),
+                series_switch=(_derived_series_switch(x.dtype)
+                               if derived_ab else None))
             if aflops_out is not None:
                 # the integrator's deviation is measured against the *midpoint*
                 # step (x_pred), which is the 1st-order version of the same
@@ -6296,16 +9162,134 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 # burned / glitchy patches.  Blend back toward the midpoint step
                 # as the error grows past rtol (err == the already-computed step
                 # error, so this is zero extra model calls).
-                if err is not None and err > tol:
+                # A/B #3a: the archive-known-good corrector took the corrected
+                # step UNCONDITIONALLY (archive line 6868: `x = aflops_out`).
+                if (corrector_ab and err is not None and err > tol):
+                    _ab_hit("corr.blend_fired", round(float(err), 8))
                     _w = max(tol / max(err, 1e-12), 0.0)
                     x = x_pred + _w * (aflops_out - x_pred)
+                    # T2c INSTRUMENTATION.  The weight actually used here, under a
+                    # name that cannot be confused with the PIXEL-blend weight that
+                    # the log's `blend_w` field carries (:7903).  An earlier attempt
+                    # to explain T2c tested `blend_w` against `tol/err` and concluded
+                    # the blend was innocent -- but it was reading the pixel-blend
+                    # field, so that refutation was itself invalid.  Rule 12: read
+                    # the use site, then measure.
+                    _corr_w_used = float(_w)
                 else:
+                    if corrector_ab:
+                        _ab_hit("corr.blend_skipped")
                     x = aflops_out
+                    _corr_w_used = None
                 corr_used = "aflops"
         if corr_used is None:
             x = x_pred
             corr_used = "mid"
         cerr = None
+        # The blend's OWN normalized distance from x_pred, in the same units as
+        # `err`/`tol` (same x0_ref), computed at the cut site.  T2c: if the blend
+        # fires it sets this to `tol` IDENTICALLY -- w = tol/err and the norm is
+        # linear in the difference -- so `_e_raw ~ tol` reduces to a statement about
+        # how far the plain step x1 is from the midpoint step x_pred.  Measuring it
+        # here is what turns that from a guess into a number.
+        # (NOT re-initialised here -- see the note at `corr_used = None` above.)
+        # Euler-safety fallback: the order-ladder midpoint + exponential
+        # integrator are OUR extra over what ComfyUI Euler does (the plain
+        # exact step x1 = exact_step(x, x0, s, s2)).  When the corrected step
+        # deviates from x1 by more than the tolerance, the correction is over
+        # budget -- the measured CFG1 'not fully resolved' downgrade, tail
+        # steps 12-15 at err/tol 1.2/1.78/2.73/5.23 with midpoint Lagrange
+        # weight wmax 3.3-3.8.  Use the plain step there (never worse than
+        # Euler), and record the deviation that triggered it.
+        # A/B #3b: the archive-known-good corrector had NO Euler-safety cut, so
+        # `corr` can never read "raw" with corrector_ab False.
+        #
+        # CORRECTNESS QUESTION BEING MEASURED (T2, scratch_tail_three_arm_rig.py):
+        # this cut compares `_e_raw` -- the deviation of the corrected step from
+        # the plain exact step -- against `tol`, an ABSOLUTE tolerance.  But the
+        # size of a legitimate correction SCALES WITH du: at the tail du is
+        # largest (0.581 against 0.105 mid-run, measured over 242 runs), so the
+        # corrected step legitimately departs furthest from the plain step
+        # exactly where the correction has the most work to do, and the cut
+        # fires there (corr='raw' on 64% of runs at the second-to-last step).
+        # If that reading is right the cut discards the BEST correction, and
+        # comparing a du-scaled quantity to a fixed tolerance is a units error
+        # rather than a tuning problem.  `euler_cut=False` is the arm that
+        # measures it; the default preserves the shipped behaviour exactly.
+        if corrector_ab and s2 > 1e-8 and corr_used in ("aflops", "mid"):
+            if not euler_cut:
+                _ab_hit("cut.disabled")
+            else:
+                _ab_hit("cut.armed")
+                # WHAT THIS CUT COMPARES -- and the derived alternative (T4).
+                #
+                # The final step is C, the blend output.  Write P = x_pred (the
+                # ladder's midpoint step) and E = x1 (the plain exact step).  The
+                # blend has ALREADY bounded the corrector's excursion:
+                #     ||C - P||_w = min(err, tol) * ||x0m||_w          (algebra: w = tol/err)
+                # so the correction is inside tolerance of the midpoint by
+                # construction.  The shipped cut then tests
+                #     ||C - E||_w / ||x0||_w  >  tol
+                # which by the triangle inequality is NOT the same quantity:
+                #     ||C - E||  <=  ||C - P||  +  ||P - E||
+                #                   ^ bounded    ^ UNBOUNDED: the ladder's own move,
+                #                     (blend)      which nothing else tests
+                # So the shipped variable mixes a term the blend owns with a term
+                # nothing owns.  Measured consequence (T2c, NOTES.md): where the
+                # ladder contributed nothing, P == E identically, so `||C - E||`
+                # collapses onto the blend's own bound and the cut evaluates
+                # `tol > tol` -- a float-rounding lottery (3 of 5 step counts fire).
+                #
+                # THE DERIVED FORM: test the term nothing else tests, and only that.
+                #     keep the ladder's midpoint  iff  ||P - E||_w / ||x0||_w <= tol
+                # i.e. fall back to the plain step exactly when the LADDER moved the
+                # step further than tolerance allows.  Properties, both checkable:
+                #   - where P == E (no ladder contribution) the test is `0 > tol`,
+                #     so it can never fire and the lottery is gone;
+                #   - where the ladder DID move the step it still fires, because the
+                #     ladder's move is a component of the shipped variable too.
+                # So the derived fire set must be a strict SUBSET of the shipped one,
+                # excluding precisely the boundary collisions.
+                #
+                # Default remains "corrected" = the shipped behaviour, byte-identical;
+                # "midpoint" is the derived arm, measured in
+                # scratch_cut_variable_rig.py.
+                if cut_var == "midpoint":
+                    _e_raw = _err_norm(x_pred, x1, err_mode, x0_ref=x0,
+                                       strength=grad_strength)
+                else:
+                    _e_raw = _err_norm(x, x1, err_mode, x0_ref=x0,
+                                       strength=grad_strength)
+                _e_raw_used = _e_raw
+                # T2c: the same distance measured to x_pred instead of x1, in the
+                # same units.  Since x_pred - x1 = (1-r)(x0m - x0), the gap between
+                # these two numbers IS the quantity that decides whether `_e_raw`
+                # lands on `tol` by construction.
+                try:
+                    _e_pred_used = _err_norm(x, x_pred, err_mode, x0_ref=x0m,
+                                             strength=grad_strength)
+                except Exception:
+                    _e_pred_used = None
+                if _e_raw is not None and _e_raw > tol:
+                    _ab_hit("cut.fired", round(float(_e_raw), 8))
+                    x = x1
+                    corr_used = "raw"
+                    cerr = _e_raw
+                # UNITS NOTE (T2b).  `_e_raw` is the distance between the corrected
+                # step and the plain exact step.  `tol` is ONE number for the whole
+                # run.  That distance scales as a power of the interval `du`
+                # (MEASURED on the quantity this cut actually tests: `_e_raw` ~
+                # du^2.158, r2 0.909, n=82, on a bounded synthetic flow), while `tol`
+                # does not move -- so the criterion is scale-mismatched and must fire
+                # hardest at the largest du, which is the tail.  Whether to rescale
+                # `tol` by (du/du_ref)^p, or to compare a du-independent quantity
+                # instead, is decided in T3/T4 on the strength of that exponent.
+                # RETRACTED HERE: this comment previously quoted `err ~ du^2.34` and
+                # `du^0.61`.  Both were computed on `err` (corrected-vs-MIDPOINT)
+                # rather than on `_e_raw` (corrected-vs-PLAIN), which is a different
+                # quantity, so both were void.  See scratch_cut_scaling_rig.py.
+                elif corrector_ab:
+                    _ab_hit("cut.not_fired")
         if s2 > 1e-8 and eff < 2:
             if err is None:
                 cerr = _err_norm(x, x1, err_mode, x0_ref=x0,
@@ -6327,7 +9311,19 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             x = x0 + (1.0 + lf_m) * (s2 / max(s, 1e-8)) * (x_input - x0) + (x - x1)
             _surgical = False
             _rho_band = None
-            if (bool(cfg.get("lf_band_refresh", True))
+            # The band-surgical (checkerboard) refresh targets late-stage
+            # banding/checkerboard artifacts on cfg>1 flow models.  On a
+            # distilled model it fires spuriously mid-run: the trajectory is
+            # flat (no band_curve baseline of its own), so hi_ref is either
+            # absent or borrowed from a foreign profile, and the detector
+            # injects refresh noise (rho up to 0.0044, steps 9-13) that a
+            # converged model cannot integrate away.  Gate it off for
+            # distilled runs (consistent with the rest of the distilled LF
+            # treatment: reduced drift budget, no semantic prior, eta tail
+            # cut).  Audited from the CFG1 distilled log: band_ref=true with
+            # zero band_curve in any dumped profile for this model.
+            if (not dist_eff
+                    and bool(cfg.get("lf_band_refresh", True))
                     and lf_gains.get("hi_ref") and jmap is not None
                     and i < len(lf_gains["hi_ref"])):
                 try:
@@ -6347,6 +9343,8 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                             _rho_band = _LF_BAND_RHO
                 except Exception:
                     _surgical = False
+            if dist_eff and lf_diag is not None:
+                lf_diag["band_off"] = "distilled"
             _rho_eff = lf_rho
             if _surgical and (_rho_eff is None or float(_rho_eff.max()) <= 1e-4):
                 # Checkerboard/banding signature detected, but the refresh
@@ -6361,12 +9359,37 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 _rho_val = _rho_band if _rho_band is not None else _LF_BAND_RHO
                 _rho_eff = torch.full(_shp, _rho_val, device=x.device,
                                       dtype=x.dtype)
-            if _rho_eff is not None and float(_rho_eff.max()) > 1e-4:
+            # Distilled gate: a distilled model converges globally by design,
+            # so its jump field collapses everywhere at once.  The stagnation
+            # channel (rho = s * tanh(log(med/j)) * sigmoid(-detail)) reads
+            # that global convergence as per-pixel stagnation and re-noises the
+            # whole image -- the flat 'inject=applied' path that still fired at
+            # steps 3-13 (rho up to 0.0049) after the band-surgical and
+            # conv_sigma gates.  There is nothing for the refresh to fix on a
+            # distilled model: kill the whole refresh application.
+            if not dist_eff and _rho_eff is not None \
+                    and float(_rho_eff.max()) > 1e-4:
+                # No-integration gate: skip the refresh once the measured
+                # trajectory has converged (sigma_next at or below the probe's
+                # conv_sigma).  Injected noise there cannot be integrated away
+                # by the remaining steps, so it is pure damage -- and it is
+                # exactly what pulled a distilled/cfg1 run below plain
+                # simple+euler.
+                if (_conv_sigma is not None
+                        and float(s2) <= float(_conv_sigma)):
+                    if lf_diag is not None:
+                        lf_diag["inject"] = "skipped:converged"
+                    _rho_eff = None
+            if not dist_eff and _rho_eff is not None \
+                    and float(_rho_eff.max()) > 1e-4:
                 x = x0 + _lf_refresh(x - x0, _rho_eff, surgical=_surgical,
                                      ramp_cap=lf_gains["ramp"],
                                      hi_boost=lf_resc_rw, gen=lf_noise_gen)
                 if lf_diag is not None:
                     lf_diag["band"] = ("surgical" if _surgical else "flat")
+                    lf_diag["inject"] = "applied"
+            elif dist_eff and lf_diag is not None:
+                lf_diag["inject"] = "off:distilled"
             lf_m_prev = lf_m.detach().squeeze(1)
             lf_amp_prev = (lf_gains["amp"]
                            * (_lf_env_fade(k / n_cand,
@@ -6452,12 +9475,110 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             hist.pop(0)
         prev_err = err
         prev_cons = step_cons
+        # ---- raw per-step measurements (cheap; logged whether used or not) ---
+        # Deliberately record RAW quantities, not just decisions, so signals we
+        # do not consume yet can still be mined out of a saved log later.
+        # x0_jump_rms is the RUN's own version of the probe's jump_curve, at
+        # full step resolution rather than the probe's coarse grid -- which is
+        # what the clamp analysis currently has to approximate.  RMS (not norm)
+        # so the numbers do not scale with latent size.
+        _raw = {}
+        try:
+            _xi = x_input.float()
+            _x0f = x0.float()
+            _x0_rms = float(_x0f.pow(2).mean().sqrt())
+            _raw["x_rms"] = round(float(_xi.pow(2).mean().sqrt()), 6)
+            _raw["x0_rms"] = round(_x0_rms, 6)
+            _raw["step_rms"] = round(float((x.float() - _xi).pow(2).mean().sqrt()), 6)
+            if len(hist) >= 2:
+                _jp = hist[-2][2].float()
+                _djump = _x0f - _jp
+                _jr = float(_djump.pow(2).mean().sqrt())
+                _raw["x0_jump_rms"] = round(_jr, 6)
+                _raw["x0_jump_rel"] = round(_jr / max(_x0_rms, 1e-8), 6)
+                # spatial structure of the JUMP: whether the movement is
+                # broad (composition) or detail-level
+                _sj = _spatial_stats(_djump)
+                _raw["dx0_std"] = round(_sj[1], 6)
+                _raw["dx0_grad"] = round(_sj[2], 6)
+                _raw["dx0_hf"] = round(_sj[3], 6)
+            # spatial/spectral structure of the clean estimate itself
+            _s0 = _spatial_stats(_x0f)
+            _raw["x0_std"] = round(_s0[1], 6)
+            _raw["x0_grad"] = round(_s0[2], 6)
+            _raw["x0_hf"] = round(_s0[3], 6)
+        except Exception:
+            pass
+        _raw["lam_min_used"] = (round(_lam_lo, 4) if _lam_lo is not None else None)
+        # which source produced the bound: "run" (the step's own measured jump),
+        # "probe" (the probe's jump curve), or "fixed" (cfg / default)
+        _raw["lam_bound_src"] = _lam_src
+        _raw["lam_max_used"] = (round(float(cfg.get("aflops_lam_max", _AFLOPS_LAM_MAX)), 4)
+                                if _lam_lo is not None else None)
+        # THE REMAINDER GATE'S OWN DECISION, logged every step it made one.  Without this
+        # the criterion cannot be audited: `wmax` is the weight the SHIPPED test reads,
+        # while this arm decides on `step_err` against `tol_eff`, and those are different
+        # quantities.  Enough digits to reproduce the comparison (rule 8).
+        _raw["wmax_budget"] = round(float(cfg.get("wmax_budget", 1.0) or 1.0), 4)
+        # WHAT THE ORDER SYSTEM WAS ASKING FOR, next to what it got (`order`/`ord_mean`).
+        # If `ord_want` is high while `ord_mean` is ~1, the LIMITER is clamping and the fix
+        # is in the limiter; if `ord_want` is ~1, the CRITERION prefers order 1 and no cap
+        # change can help.  `ord_innov` is the curve whose argmin chooses p_star.
+        if _ord_want is not None:
+            _raw["ord_want"] = round(float(_ord_want), 4)
+        if _ord_ps is not None:
+            _raw["ord_pstar"] = round(float(_ord_ps), 4)
+        if _ord_innov is not None:
+            _raw["ord_innov"] = _ord_innov
+        # The Runge criterion's record: per order, the mean remainder bound and the fraction
+        # of pixels admitted.  This is where the spatial adaptivity is visible -- if the
+        # criterion is doing what it claims, order 5-6 is admitted on SOME pixels while order
+        # 2 is refused on others in the same step.
+        if _ord_bound is not None:
+            _raw["order_by_bound"] = True
+            _raw["ord_bmax"] = _ord_bound.get("kmax")
+            _raw["ord_btol"] = _ord_bound.get("tol_x0")
+            _raw["ord_bper_k"] = _ord_bound.get("per_k")
+        # The forced floor's own record: the value in force and how many pixels it raised.
+        # `order_floor` is in the cfg dump, but a per-step count is what shows it ACTED.
+        if _order_floor > 1.0:
+            _raw["ord_floor"] = _order_floor
+            _raw["ord_floor_px"] = _ord_floor_n
+        if _wgate_info is not None:
+            _raw["wbound"] = float(_wgate_info["step_err"])
+            _raw["wtol"] = round(float(_wgate_info["tol_eff"]), 9)
+            _raw["wgate_k"] = int(_wgate_info["k"])
+            _raw["wgeom"] = float(_wgate_info["geom"])
         if len(_LAST_ERRORS) < 64 or log_errors:
             _LAST_ERRORS.append({"mode": "engine", "step": k,
                                  "sigma": round(s, 6), "sigma_next": round(sn, 6),
                                  "err": None if err is None or math.isinf(err) else round(err, 6),
                                  "cerr": (None if cerr is None
                                           else round(cerr, 6)),
+                                 # THE CUT'S OWN DECISION VARIABLE, logged every
+                                 # step the cut is armed -- not only when it fires.
+                                 # Without this the criterion cannot be audited:
+                                 # `err` is the corrected-vs-MIDPOINT distance,
+                                 # while the cut tests `_e_raw` = corrected-vs-PLAIN,
+                                 # and those are different quantities.  Measured in
+                                 # scratch_cut_scaling_rig.py, which initially
+                                 # analysed `err` and drew the wrong power law.
+                                 #
+                                 # NINE decimals, not six: the decision is `_e_raw > tol`
+                                 # and `_e_raw` lands within ~1e-6 of tol at the
+                                 # largest-du step, so a 6dp log cannot reproduce the
+                                 # engine's own fire/no-fire decision.  The rig's
+                                 # self-validation check caught exactly that.
+                                 "e_raw": (None if _e_raw_used is None
+                                           else round(_e_raw_used, 9)),
+                                 # T2c diagnostics: the blend weight ACTUALLY used
+                                 # (distinct from `blend_w`, which is the
+                                 # pixel-blend mean), and the same deviation
+                                 # measured to x_pred instead of x1.
+                                 "corr_w": (None if _corr_w_used is None
+                                            else round(_corr_w_used, 9)),
+                                 "e_pred": (None if _e_pred_used is None
+                                            else round(_e_pred_used, 9)),
                                  "tol": round(tol, 6), "order": eff,
                                  "eff_cap": eff_cap,
                                  "hist_cos": (round(hist_cos_val, 4)
@@ -6490,9 +9611,17 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                                                 hasattr(noise_sampler, "last_beta") else None),
                                  "aflops_lam": (round(aflops_lam, 4)
                                                 if aflops_lam is not None else None),
+                                 # The UNCLAMPED estimate.  Reporting only the
+                                 # clamped one made it impossible to tell from a
+                                 # log whether the clamp was binding or what
+                                 # the raw estimate even looked like.
+                                 "aflops_lam_raw": (round(aflops_lam_raw, 4)
+                                                    if aflops_lam_raw is not None
+                                                    else None),
                                  "lf": lf_diag,
                                  "dwell": dwell_tel,
-                                 "calls": calls})
+                                 "calls": calls,
+                                 **_raw})
             if len(_LAST_ERRORS) > 64:
                 del _LAST_ERRORS[:-64]
         if log_errors:
@@ -6536,6 +9665,17 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 logging.info("[A-FloPS-lf] run direction feedback: "
                              "dir_real=%.3f (%d steps measured)",
                              _dir_val, lf_dir_acc[1])
+    except Exception:
+        pass
+    # Final A/B reachability snapshot, taken AFTER the loop so it reflects what
+    # actually ran rather than the empty record built before it.  This is what
+    # makes a saved log self-describing about its own A/B validity.
+    try:
+        _LAST_CFG["ab_reach"] = _ab_reach_snapshot()
+        # Rule 9 for the remainder gate: a switch wired to nothing is indistinguishable
+        # from one whose effect is below the noise floor.  Every verdict is counted, and
+        # the run's own record carries the count.
+        _LAST_CFG["wmax_gate"] = dict(_ORDER_GATE_AB)
     except Exception:
         pass
     return x
