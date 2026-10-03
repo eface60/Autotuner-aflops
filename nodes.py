@@ -54,11 +54,9 @@ class ResearchAFlopsSampler:
                    "integrator. Pure single-solver engine: every step runs the "
                    "A-FloPS formula with ZERO extra model calls, and the per-pixel "
                    "adaptive order ladder feeds the residual integrator. Without extra "
-                   "inputs it runs fully automatic: stochasticity (a minimal-noise, "
-                   "escape-based schedule that fades late) controls how much random "
-                   "noise is added each step, and everything else (noise color, anomaly "
+                   "inputs it runs fully automatic: noise colour, anomaly "
                    "detection, the local per-region schedule field with its spatial "
-                   "fragility prior, flow/VE detection) is self-tuned from the probes. "
+                   "fragility prior, and flow/VE detection are all self-tuned from the probes. "
                    "Connect a MODEL for auto-detection. "
                    "Connect Options nodes to override any group of settings.")
     CATEGORY = "custom_sampling/research_samplers"
@@ -71,10 +69,12 @@ class ResearchAFlopsSampler:
                     "tooltip": "Writes what the sampler decides at every step to the console, and fills the A-FloPS Error Report node. Leave it on while you are testing a prompt; off for normal use."}),
                 "lf_ab": ("BOOLEAN", {"default": True,
                     "tooltip": "Turns the local field on or off. ON: the sampler also makes small local corrections, in the areas where its own step is least reliable. OFF: no local corrections; the step placement, the corrector and the order are untouched. Use OFF to check whether a late-stage artifact comes from the local field."}),
-                "order_by_bound": ("BOOLEAN", {"default": False,
+                "order_by_bound": ("BOOLEAN", {"default": True,
                     "tooltip": "Chooses how the sampler picks the per-pixel ORDER. Order = how many previous steps the sampler looks at when it works out where the image is heading. OFF: it takes the number of previous steps that predicts the next one best. ON: it takes the highest number of previous steps that is still safe for that pixel, so smooth areas get a high order and busy or detailed areas keep a low one. Has no effect when the per-pixel order is turned off; it is on by default."}),
-                "order_floor": ("INT", {"default": 1, "min": 1, "max": 6, "step": 1,
-                    "tooltip": "Sets the lowest order the sampler may use, per pixel. 1 = the sampler decides by itself, and this setting does nothing. Above 1, every pixel is pushed up to at least this value, which makes the sampler follow the direction of the trajectory harder. Two safeguards still apply: an order is refused when the step would come out too large, and a pixel the sampler has just reset stays at 1."}),
+                "order_floor": ("INT", {"default": 6, "min": 1, "max": 6, "step": 1,
+                    "tooltip": "Sets the lowest order the sampler may use, per pixel. 1 = the sampler decides by itself, and this setting does nothing. Above 1, every pixel is pushed up to at least this value, which makes the sampler follow the direction of the trajectory harder. Two safeguards still apply: an order is refused when the step would come out too large, and a pixel the sampler has just reset stays at 1. 6 is the shipped default; set it to 1 to let the sampler decide entirely on its own."}),
+                "wmax_eg_dir": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.25,
+                    "tooltip": "Which way the sampler reacts when its own end-of-run error measurement comes out HIGH. 0 (shipped default) = no reaction; the error-based limit acts alone. +1 = it allows the most extrapolation then. -1 = it does the OPPOSITE and allows the least extrapolation then. This setting decides WHICH PIXELS get the higher extrapolation order, so it changes the STRUCTURE of the image more than its overall detail or sharpness. Measured: -1 is worse than +1 against an exact ODE solution on three analytic flows (by up to 47%); that test scores distance to an exact solution and not how an image looks, and by eye the operator's preference across many runs and two model families has been the positive side. The response saturates, so +0.5 already behaves much like +1."}),
             },
             "optional": {
                 "model": ("MODEL", {"tooltip": "Connect the MODEL for auto-tuning. A-FloPS will detect the model type (flow vs VE), read sigma_data for correct SNR math, detect video latents (auto-enables temporal noise shaping), and detect distilled models (turbo/schnell/lightning). All auto-tuning can be overridden by Options nodes. Without this, A-FloPS uses a sigma-magnitude heuristic."}),
@@ -89,28 +89,41 @@ class ResearchAFlopsSampler:
     def get_sampler(self, **kw):
         log = _b(kw["log_errors"])
         merged = dict(ENGINE_DEFAULTS)
-        # The corrector A/B arm.  Set BEFORE the Options nodes are applied so a
-        # connected Options node can still override it.
+        # The corrector A/B arm.  NO LONGER A WIDGET (release build): it is fixed at its
+        # engine default.  This branch stays so a saved graph, or an Options node that sets
+        # the key, is honoured rather than silently ignored -- the normal case now is that
+        # it never fires.  Set BEFORE the Options nodes are applied so a connected Options
+        # node can still override it.
         if "corrector_ab" in kw:
             merged["corrector_ab"] = _b(kw["corrector_ab"])
-        # The order/extrapolation A/B arm (same convention).
+        # The order/extrapolation A/B arm (same convention, same reason it is not a widget).
         if "order_ab" in kw:
             merged["order_ab"] = _b(kw["order_ab"])
-        # The forced per-pixel order floor (same convention).  Lives HERE, next to its
-        # sibling `order_ab`, and deliberately NOT on the Autotuner: it is a per-STEP
-        # setting, not a probe input, and one switch in one place is the rule this project
-        # has already paid for.
+        # The forced per-pixel order floor.  This one IS a widget: it is a real user-facing
+        # setting, it lives HERE (the Sampler) and deliberately NOT on the Autotuner,
+        # because it is a per-STEP setting and not a probe input -- one switch in one place.
         if "order_floor" in kw:
             merged["order_floor"] = int(kw["order_floor"])
         # Which per-pixel ORDER CRITERION runs (same convention, same single owner).
         if "order_by_bound" in kw:
             merged["order_by_bound"] = _b(kw["order_by_bound"])
+        # The SIGN of the endgame-error response.  Same placement rule as `order_floor`: it is a
+        # per-STEP setting and not a probe input, so it is a widget HERE (the Sampler) and
+        # deliberately NOT in the Autotuner's `opts` -- one switch in one place (see the
+        # `order_floor` note above for why two copies with one name is the defect, not a
+        # convenience).  It was briefly only an ENGINE_DEFAULTS entry, which was unusable for
+        # testing: a default lives in the source, so every arm of an A/B would have needed a
+        # ComfyUI restart.  Clamped here as well as in the engine, so a saved graph from before
+        # the clamp cannot inject an out-of-range value.
+        if "wmax_eg_dir" in kw:
+            merged["wmax_eg_dir"] = max(-1.0, min(1.0, _f(kw["wmax_eg_dir"])))
         # The two DERIVED-CONSTANT arms.  Independent, so each can be flipped alone; the
         # derivation logs BOTH the shipped and the derived value regardless, so one run
         # shows the delta even with the switch off.
-        # NOTE: pct_derived / wmax_bound are deliberately NOT widgets on this node.  The
-        # AUTOTUNER owns them, because it is the node that runs the probes.  Its `options`
-        # output is applied at line ~131 BELOW, i.e. AFTER these assignments, so an
+        # NOTE: pct_derived / wmax_bound are NOT WIDGETS ON EITHER NODE in the release build
+        # (the Autotuner used to own them).  They are fixed at their engine defaults and are
+        # kept here only so Options nodes and saved graphs can still drive them.  The
+        # Autotuner's `options` output is applied BELOW, i.e. AFTER these assignments, so an
         # Autotuner copy would silently override a Sampler copy anyway -- two switches with
         # one name, where one of them quietly does nothing.  One switch, one place.
         # DERIVED CONSTANTS and the CUT VARIABLE are NO LONGER WIDGETS -- both A/Bs
@@ -691,10 +704,15 @@ class ResearchAFlopsErrorReport:
             # cond-probe engine support lands.  getattr avoids an
             # AttributeError that would silently empty this section.
             _cond_store = getattr(aflops_mod, '_COND_PROBE_PROFILES', {})
+            # ONE FORMATTER, SHARED WITH THE ENGINE -- called directly, with NO inline
+            # fallback: a fallback that re-spells the key is how the two spellings diverged
+            # in the first place (the log's store keys and the stamped `cfg["_cond_probe_key"]`
+            # matched in 0 of 443 logs).  If the helper is ever missing, that is an error worth
+            # seeing, not one worth papering over.
             for key, prof in _cond_store.items():
                 if not _own_cond(key):
                     continue
-                cond_probe_summary["%s | prompt %s" % (key[0], key[1])] = {
+                cond_probe_summary[aflops_mod._cond_key_str(key)] = {
                     "cond_sig": prof.get("cond_sig"),
                     "space": prof.get("space"),
                     "n_probe_steps": prof.get("n_probe_steps"),
