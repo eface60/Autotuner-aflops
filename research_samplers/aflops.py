@@ -76,7 +76,7 @@ _MODEL_KEY_KIND = None
 # ---------------------------------------------------------------------------
 # PER-RUN PHASE TIMING.
 #
-# WHY THIS EXISTS.  A-FLOPS logged NO timing at all -- zero `perf_counter`, zero
+# WHY THIS EXISTS.  PD-AOS logged NO timing at all -- zero `perf_counter`, zero
 # `elapsed`, zero `duration_ms` anywhere -- so "the autotuner probes feel
 # extremely slow since a while" could not be checked from any artifact this
 # project produces.  It was checked from ComfyUI's own log instead, and that
@@ -309,7 +309,7 @@ def _build_identity():
 
 
 _BUILD = _build_identity()
-logging.info("[A-FloPS] build src=%s git=%s@%s files=%d%s",
+logging.info("[PD-AOS] build src=%s git=%s@%s files=%d%s",
              _BUILD.get("src_hash"), _BUILD.get("git_commit"),
              _BUILD.get("git_branch"), len(_BUILD.get("src_files") or []),
              (" missing=%s" % ",".join(_BUILD["src_missing"]))
@@ -324,7 +324,7 @@ def _validate_exact_step():
     if _exact_step_ext is None:
         exact_step = _exact_step_local
         _EXACT_STEP_STATUS = "fallback: .common.exact_step unavailable"
-        logging.warning("[A-FloPS] %s", _EXACT_STEP_STATUS)
+        logging.warning("[PD-AOS] %s", _EXACT_STEP_STATUS)
         return
     try:
         g = torch.Generator().manual_seed(0)
@@ -347,11 +347,11 @@ def _validate_exact_step():
             exact_step = _exact_step_local
             _EXACT_STEP_STATUS = ("fallback: .common.exact_step deviates %.2e "
                                   "from (s2/s)x+(1-s2/s)x0" % worst)
-            logging.warning("[A-FloPS] %s", _EXACT_STEP_STATUS)
+            logging.warning("[PD-AOS] %s", _EXACT_STEP_STATUS)
     except Exception as e:
         exact_step = _exact_step_local
         _EXACT_STEP_STATUS = "fallback: validation error (%s)" % e
-        logging.warning("[A-FloPS] %s", _EXACT_STEP_STATUS)
+        logging.warning("[PD-AOS] %s", _EXACT_STEP_STATUS)
 
 _validate_exact_step()
 
@@ -997,7 +997,7 @@ def _probe_rank_ladder_run(run_at_rank, ladder, degenerate_fn):
             prof = run_at_rank(r)
         except Exception as e:
             tried.append(r)
-            logging.info("[A-FloPS-probe] rank %s failed: %s", r, e)
+            logging.info("[PD-AOS-probe] rank %s failed: %s", r, e)
             continue
         tried.append(r)
         if prof is None:
@@ -1011,7 +1011,7 @@ def _probe_rank_ladder_run(run_at_rank, ladder, degenerate_fn):
             bad = False
         if not bad:
             if len(tried) > 1:
-                logging.info("[A-FloPS-probe] rank ladder: rank %s was "
+                logging.info("[PD-AOS-probe] rank ladder: rank %s was "
                              "degenerate, using rank %s (tried %s)",
                              tried[0], r, tried)
             return prof, r, tried
@@ -1411,11 +1411,50 @@ def _extra_cond_signature(extra_args):
     except Exception:
         return None
 
+def _graded_demand(ratio, rtol, lo, hi, r_hi, cap, graded):
+    """THE ONE OWNER OF THE AUTOMATIC MODE'S DEMAND LEVEL.  Called by the demand site AND by the per-step stamp,
+    so the level the record reports is the level the maths used -- by construction, not by coincidence.  Two copies
+    of this formula is how a stamp drifts from the value in force (the `cond_rtol_loosen` defect).
+
+    `ratio` is the CARRIED `err/tol` (None on the first step).  Below the trigger it returns 1.0, i.e. the
+    existing gate semantics; with `graded` False it returns `cap` (the previous flat behaviour, kept so the two can
+    be compared in one A/B); with `graded` True it ramps from `lo` to `hi` across (rtol, r_hi] and clamps to
+    [1, cap].  Monotone non-decreasing in `ratio` by construction.
+    """
+    if ratio is None or ratio <= rtol:
+        return 1.0
+    if not graded:
+        return float(cap)
+    frac = min(max((ratio - rtol) / max(r_hi - rtol, 1e-9), 0.0), 1.0)
+    # CLAMP TO `max(cap, hi)`, not to `cap`: with the shipped defaults (hi = 5 < cap = 6) this is exactly the old
+    # clamp and the shipped behaviour is unchanged, but a deliberate `hi` ABOVE the flat value is honoured instead
+    # of being silently swallowed.  `graded = False` still returns `cap` exactly, so the negative control holds.
+    return float(min(max(round(lo + (hi - lo) * frac), 1.0), max(cap, hi)))
+
+
+def _cond_probe_dims(cfg):
+    """THE PROBE DIMENSIONS, as they belong in every COND cache key (2026-10-05).
+
+    WHY THIS EXISTS.  `cond_probe_steps` and `cond_probe_resolution` change what the cond probe
+    MEASURES -- the resolution it measures at and the length of every curve (`aflops.py:1561` records
+    `curv_curve` carrying m-2 entries, and `aflops.py:1577` records that a profile measured at 4 steps
+    carries a curve of length 2).  By rule 28 a switch that changes what is measured MUST be in the cache
+    key, and these two were in NEITHER of the two key paths, so a run asking for 4 steps was served a
+    profile measured at 8: the operator's own test changed both widgets between two runs and got
+    byte-identical curves out, with `cond_probe_state: cached` in both.
+
+    The values here are the EFFECTIVE ones (the same clamps the probe applies), so two requests that
+    clamp to the same measurement share an entry instead of fragmenting the cache.
+    """
+    return "|k%d/r%d" % (max(3, int(cfg.get("cond_probe_steps", 4))),
+                         max(8, int(cfg.get("cond_probe_resolution", 16))))
+
+
 def _cond_cache_key(cfg, extra_args, model_key):
     cond_sig = cfg.get("cond_probe_sig")
     if not cond_sig:
         cond_sig = _extra_cond_signature(extra_args)
-    return (model_key, str(cond_sig)) if cond_sig else None
+    return (model_key, str(cond_sig) + _cond_probe_dims(cfg)) if cond_sig else None
 
 
 def _cond_key_str(ckey):
@@ -2911,7 +2950,7 @@ def _lf_rescue_cov_curve(xs, x0s, grid, eg_n, floor_mag, ref=32):
                 if not _FROZEN_PROBE_LOGGED:
                     _FROZEN_PROBE_LOGGED = True
                     logging.warning(
-                        "[A-FloPS-probe] trajectory FROZEN (median "
+                        "[PD-AOS-probe] trajectory FROZEN (median "
                         "||dx0||/||x0|| = %.3g): the model call is returning its "
                         "input, so no k and no k*du curve. This is a PROBE BUG, "
                         "not a model property -- see NOTES.md.", _rel_med)
@@ -3902,7 +3941,7 @@ def _probe_model_options(extra_args):
             changed = True
             if not _CFG_HOOK_STRIP_LOGGED[0]:
                 _CFG_HOOK_STRIP_LOGGED[0] = True
-                logging.info("[A-FloPS-probe] sampling cfg-function hook(s) "
+                logging.info("[PD-AOS-probe] sampling cfg-function hook(s) "
                              "disabled for probe calls (%s): a probe measures "
                              "THE MODEL, not the graph's CFG wrapper -- "
                              "comfy/samplers.py:596 returns x - hook(args), so "
@@ -3937,7 +3976,7 @@ def _probe_model_options(extra_args):
                 changed = True
                 if not _CACHE_ISOLATION_LOGGED[0]:
                     _CACHE_ISOLATION_LOGGED[0] = True
-                    logging.info("[A-FloPS-probe] model-internal cache options "
+                    logging.info("[PD-AOS-probe] model-internal cache options "
                                  "disabled for probe calls (%s): probe-shaped "
                                  "sequences must never read or fill the model's "
                                  "own caches", ", ".join(sorted(off_keys)))
@@ -3990,7 +4029,7 @@ def _probe_model_cache_guard(model, disable=True):
                 reset(False)
                 if not _CACHE_ISOLATION_LOGGED[0]:
                     _CACHE_ISOLATION_LOGGED[0] = True
-                    logging.info("[A-FloPS-probe] model-internal per-run "
+                    logging.info("[PD-AOS-probe] model-internal per-run "
                                  "cache disabled for the probe measurement "
                                  "(instance switch), re-armed afterwards")
         else:
@@ -4059,7 +4098,7 @@ def _probe_model_call(model, x, sigma, extra_args):
             _shape = tuple(dropped.shape)
         except Exception:
             _shape = None
-        logging.info("[A-FloPS-probe] probing unmasked: the run's "
+        logging.info("[PD-AOS-probe] probing unmasked: the run's "
                      "denoise_mask does not apply to the synthetic probe "
                      "latent (%s dropped)",
                      "shape %s" % (_shape,) if _shape is not None
@@ -4793,7 +4832,7 @@ def _probe_endgame(model, extra_args, x0_final, grid_last, pos_all, ones,
                            "jmp_q": _qs(jmp)})
         return {"levels": levels, "n": int(rec_a.numel())}
     except Exception as e:
-        logging.warning("[A-FloPS-probe] endgame measurement skipped: %s", e)
+        logging.warning("[PD-AOS-probe] endgame measurement skipped: %s", e)
         return None
 
 
@@ -4933,7 +4972,7 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
         _dev_retry_done = False
         for i, s in enumerate(grid):
             _progress(callback, "probe", "progress", i, len(grid) + 4,
-                      "A-FloPS model probe: step %d/%d" % (i + 1, len(grid)))
+                      "PD-AOS model probe: step %d/%d" % (i + 1, len(grid)))
             x0 = None
             try:
                 x0 = _probe_model_call(model, cur, s * ones, extra_args)
@@ -4949,16 +4988,16 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
                         if ones.device != _dev:
                             ones = ones.to(_dev)
                         x0 = _probe_model_call(model, cur, s * ones, extra_args)
-                        logging.info("[A-FloPS-probe] recovered from a "
+                        logging.info("[PD-AOS-probe] recovered from a "
                                      "device mismatch at s=%.4g (model "
                                      "re-secured on %s)", s, _dev)
                     except Exception:
                         x0 = None
                 if x0 is None:
                     import traceback as _tb
-                    logging.warning("[A-FloPS-probe] model call failed at s=%.4g: %s", s, e)
-                    logging.warning("[A-FloPS-probe] failure traceback:\n%s", _tb.format_exc())
-                    logging.warning("[A-FloPS-probe] failure context: %s",
+                    logging.warning("[PD-AOS-probe] model call failed at s=%.4g: %s", s, e)
+                    logging.warning("[PD-AOS-probe] failure traceback:\n%s", _tb.format_exc())
+                    logging.warning("[PD-AOS-probe] failure context: %s",
                                     _probe_failure_diagnostics(model, cur, ones, extra_args, None))
                     break
             xs.append(cur)
@@ -5159,8 +5198,8 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
         _ns_ov = cfg.get("probe_noise_survival")
         _do_noise_survival = (cfg.get("eta") is not None) if _ns_ov is None else bool(_ns_ov)
         _progress(callback, "probe", "progress", len(grid), len(grid) + 4,
-                  "A-FloPS model probe: noise survival" if _do_noise_survival else
-                  "A-FloPS model probe: noise survival skipped (no eta consumer)")
+                  "PD-AOS model probe: noise survival" if _do_noise_survival else
+                  "PD-AOS model probe: noise survival skipped (no eta consumer)")
         if _do_noise_survival:
             safe_f = _probe_noise_survival(model, extra_args, xs, x0s, grid, ones,
                                            gen=_probe_gen(x))
@@ -5176,7 +5215,7 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
         endgame = None
         if bool(cfg.get("probe_endgame", True)):
             _progress(callback, "probe", "progress", len(grid) + 1, len(grid) + 4,
-                      "A-FloPS model probe: endgame")
+                      "PD-AOS model probe: endgame")
             pos_all_eg = [float(v) for v in sigmas if float(v) > 1e-6]
             endgame = _probe_endgame(model, extra_args, x0s[-1], grid[-1],
                                      pos_all_eg, ones, space, _probe_gen(x))
@@ -5224,6 +5263,12 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
             "med_local_err_real": (_pct(local_errs_real, 0.5)
                                    if local_errs_real else 0.0),
             "curv_curve": [round(v, 6) for v in curvs],
+            # THE SIGMA EACH CURVATURE POINT IS ANCHORED AT.  The convention is documented at
+            # `aflops.py:7687` -- `curv_curve[k]` is the curvature at `sigma_curve[k+1]`, curves carry
+            # m-2 entries against the grid's m -- and a reader who does not know it will mis-align every
+            # derivation, as a rig of mine did this session.  Logging the anchors removes the need to
+            # know it.
+            "curv_sigma": [round(float(v), 6) for v in grid[1:1 + len(curvs)]],
             # PROBE-SIDE COVERAGE CURVE.  The same statistic the rescue gate
             # consumes in the run (`frac`), computed along THIS probe trajectory
             # by the SAME function, so a pitfall like the coverage cliff can be
@@ -5299,7 +5344,7 @@ def _run_probe(model, x, sigmas, extra_args, cfg, callback=None):
         profile["trajectory_state"] = _compute_trajectory_state(profile)
         return profile
     except Exception as e:
-        logging.warning("[A-FloPS-probe] probe failed: %s", e)
+        logging.warning("[PD-AOS-probe] probe failed: %s", e)
         return None
 
 def _recalibrated(profile, cfg, derive):
@@ -5439,11 +5484,11 @@ def _ensure_model_gpu(model_patcher):
         if _load is None:
             return False
         _load([model_patcher])
-        logging.info("[A-FloPS-probe] model nudged onto %s before probing "
+        logging.info("[PD-AOS-probe] model nudged onto %s before probing "
                      "(ComfyUI had left it offloaded)", ld)
         return True
     except Exception as e:
-        logging.info("[A-FloPS-probe] could not nudge model onto the GPU "
+        logging.info("[PD-AOS-probe] could not nudge model onto the GPU "
                      "before probing (continuing on current devices): %s", e)
         return False
 
@@ -5553,7 +5598,7 @@ def _generate_provisional_sigmas(model_patcher, steps=20):
                                           tail_steps=1)
         return sigmas
     except Exception as e:
-        logging.warning("[A-FloPS-probe] could not generate provisional "
+        logging.warning("[PD-AOS-probe] could not generate provisional "
                         "sigmas: %s", e)
         return None
 
@@ -5616,7 +5661,7 @@ def _engine_cond_probe_run(model_patcher, positive, negative, cfg_scale,
                            probe_kind="cond"):
     """Run a probing pass as a REAL ComfyUI sampling run.
 
-    This is the only way A-FloPS probes ever touch a model: the probe
+    This is the only way PD-AOS probes ever touch a model: the probe
     trajectory executes as the sampler function of a genuine
     CFGGuider + KSAMPLER run, so every model evaluation goes through
     ComfyUI's own sampling chain (prepare_sampling, process_conds,
@@ -5740,7 +5785,7 @@ def _engine_cond_probe_run(model_patcher, positive, negative, cfg_scale,
                     _probe_model_cache_guard(model, False)
             except Exception as e:
                 import traceback as _tb
-                logging.warning("[A-FloPS-%s-probe] probing run failed "
+                logging.warning("[PD-AOS-%s-probe] probing run failed "
                                 "inside the sampling window: %s\n%s",
                                 probe_kind, e, _tb.format_exc())
             return x
@@ -5773,12 +5818,12 @@ def _engine_cond_probe_run(model_patcher, positive, negative, cfg_scale,
                 _sample_err = _se
                 break
         if _sample_err is not None:
-            logging.warning("[A-FloPS-%s-probe] probing run could not start "
+            logging.warning("[PD-AOS-%s-probe] probing run could not start "
                             "through the ComfyUI sampling chain: %s",
                             probe_kind, _sample_err)
             return None
         if holder["profile"] is not None:
-            logging.info("[A-FloPS-%s-probe] probing run executed as a "
+            logging.info("[PD-AOS-%s-probe] probing run executed as a "
                          "real ComfyUI sampling run (device state fully "
                          "prepared by the runtime: load_models_gpu + "
                          "additional models, cuda_device_context, "
@@ -5802,7 +5847,7 @@ def _engine_cond_probe_run(model_patcher, positive, negative, cfg_scale,
         return holder["profile"]
     except Exception as e:
         import traceback as _tb
-        logging.info("[A-FloPS-%s-probe] engine-run probe unavailable "
+        logging.info("[PD-AOS-%s-probe] engine-run probe unavailable "
                      "(falling back to the direct path): %s\n%s",
                      probe_kind, e, _tb.format_exc())
         return None
@@ -5840,8 +5885,11 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
         mk = _model_cache_key(model_patcher)
         cond_sig = cfg.get("cond_probe_sig")
         ext = _norm_sig_list(sigmas)
-        _key = (mk, str(cond_sig) + ("|g:" + _sig_list_sig(ext)
-                                    if ext is not None else ""))
+        # THE SAME DIMENSION SUFFIX AS `_cond_cache_key` -- one helper, so the node-side path and this
+        # one cannot drift into writing and reading different keys (the failure `_cond_key_str` was
+        # created to end).
+        _key = (mk, str(cond_sig) + _cond_probe_dims(cfg)
+                + ("|g:" + _sig_list_sig(ext) if ext is not None else ""))
         if cond_sig is not None and not bool(cfg.get("cond_probe_force", False)):
             cached = _COND_PROBE_PROFILES.get(_key)
             if cached is not None:
@@ -5854,7 +5902,7 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
                 # state beside it at all (10 runs), because `node_probe_state` belongs to the model
                 # probe.  The vocabulary deliberately mirrors it: cache_hit / empty_deferred / ran.
                 _nphase_set("node_cond_probe_state", "cache_hit")
-                logging.info("[A-FloPS-cond-probe] node-side probe: model+prompt "
+                logging.info("[PD-AOS-cond-probe] node-side probe: model+prompt "
                              "unchanged, using cached profile (skip re-probe)")
                 return cached, True
         if ext is not None:
@@ -5912,7 +5960,7 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
             # No hand-rolled fallback: if the node-side chain run could not
             # execute, defer to the engine-side probe, which runs inside the
             # real sampling run through the very same ComfyUI chain.
-            logging.info("[A-FloPS-cond-probe] node-side chain probe did "
+            logging.info("[PD-AOS-cond-probe] node-side chain probe did "
                          "not execute; deferring to the engine-side probe "
                          "at sampling time")
             _nphase_set("node_cond_probe_state", "empty_deferred")
@@ -5930,7 +5978,7 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
         _nphase_set("node_cond_probe_state", "ran")
         return profile, False
     except Exception as e:
-        logging.warning("[A-FloPS-cond-probe] node-side probe failed "
+        logging.warning("[PD-AOS-cond-probe] node-side probe failed "
                         "(falling back to engine-side): %s", e)
         return None, False
 
@@ -5940,12 +5988,12 @@ def _run_node_side_cond_probe_guider(guider, cfg, cfg_scale=None,
     if patcher is None:
         patcher = _navigate_to_patcher(guider)
     if patcher is None:
-        logging.warning("[A-FloPS-cond-probe] guider exposes no ModelPatcher; "
+        logging.warning("[PD-AOS-cond-probe] guider exposes no ModelPatcher; "
                         "node-side probe skipped")
         return None, False
     positive, negative = _guider_conds(guider)
     if positive is None and negative is None:
-        logging.warning("[A-FloPS-cond-probe] guider carries no conditioning; "
+        logging.warning("[PD-AOS-cond-probe] guider carries no conditioning; "
                         "node-side probe skipped")
         return None, False
     eff_cfg = _guider_probe_cfg(guider)
@@ -6009,7 +6057,7 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
     This is the model-probe counterpart of _run_node_side_cond_probe_guider.
     Without it the model probe only runs inside aflops_engine at SAMPLING
     time, so the profile arrives one generation too late for any node that
-    executes before the KSampler -- most importantly the A-FloPS Scheduler,
+    executes before the KSampler -- most importantly the PD-AOS Scheduler,
     whose probe-based shift recommendation and distilled detection are blind
     on the first run.
 
@@ -6036,12 +6084,12 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
         if patcher is None:
             patcher = _navigate_to_patcher(guider)
         if patcher is None:
-            logging.info("[A-FloPS-probe] guider exposes no ModelPatcher; "
+            logging.info("[PD-AOS-probe] guider exposes no ModelPatcher; "
                          "node-side model probe skipped")
             return None, False
         positive, negative = _guider_conds(guider)
         if positive is None and negative is None:
-            logging.info("[A-FloPS-probe] guider carries no conditioning; "
+            logging.info("[PD-AOS-probe] guider carries no conditioning; "
                          "node-side model probe skipped")
             return None, False
         eff_cfg = _guider_probe_cfg(guider)
@@ -6066,7 +6114,7 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
             if cached is not None and int(cached.get("version", 1) or 1) >= 7:
                 _PROFILE_BY_MODEL[mk] = cached
                 _nphase_set("node_probe_state", "cache_hit")
-                logging.info("[A-FloPS-probe] node-side probe: model "
+                logging.info("[PD-AOS-probe] node-side probe: model "
                              "unchanged, using cached profile (skip "
                              "re-probe)")
                 return cached, True
@@ -6136,7 +6184,7 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
             # No hand-rolled fallback: the engine-side probe (inside the
             # real sampling run, through the very same ComfyUI chain) takes
             # over at sampling time instead.
-            logging.info("[A-FloPS-probe] node-side chain probe did not "
+            logging.info("[PD-AOS-probe] node-side chain probe did not "
                          "execute; deferring to the engine-side probe at "
                          "sampling time")
             _nphase_set("node_probe_state", "empty_deferred")
@@ -6154,7 +6202,7 @@ def _run_node_side_model_probe(guider, cfg, cfg_scale=None, sigmas=None):
         _PROFILE_BY_MODEL[mk] = profile
         return profile, False
     except Exception as e:
-        logging.warning("[A-FloPS-probe] node-side probe failed (falling "
+        logging.warning("[PD-AOS-probe] node-side probe failed (falling "
                         "back to engine-side): %s", e)
         return None, False
 
@@ -6508,7 +6556,7 @@ def _measure_guidance_gap(model, extra_args, xs, x0s, grid, ones,
         if guider is None:
             # No guider in reach -> skip the measurement.  Decomposing cond
             # vs uncond without ComfyUI's own guider would need hand-rolled
-            # per-model CFG code, which A-FloPS no longer carries; the
+            # per-model CFG code, which PD-AOS no longer carries; the
             # consumers treat a missing gap as "unknown guidance strength".
             return None
 
@@ -6884,7 +6932,7 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         _dev_retry_done = False
         for i, s in enumerate(grid):
             _progress(callback, "cond_probe", "progress", i, len(grid) + 4,
-                      "A-FloPS focused probe: step %d/%d" % (i + 1, len(grid)))
+                      "PD-AOS focused probe: step %d/%d" % (i + 1, len(grid)))
             x0 = None
             try:
                 x0 = _probe_model_call(model, cur, s * ones, extra_args)
@@ -6899,16 +6947,16 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                         if ones.device != _dev:
                             ones = ones.to(_dev)
                         x0 = _probe_model_call(model, cur, s * ones, extra_args)
-                        logging.info("[A-FloPS-focused] recovered from a "
+                        logging.info("[PD-AOS-focused] recovered from a "
                                      "device mismatch at s=%.4g (model "
                                      "re-secured on %s)", s, _dev)
                     except Exception:
                         x0 = None
                 if x0 is None:
                     import traceback as _tb
-                    logging.warning("[A-FloPS-focused] model call failed at s=%.4g: %s", s, e)
-                    logging.warning("[A-FloPS-focused] failure traceback:\n%s", _tb.format_exc())
-                    logging.warning("[A-FloPS-focused] failure context: %s",
+                    logging.warning("[PD-AOS-focused] model call failed at s=%.4g: %s", s, e)
+                    logging.warning("[PD-AOS-focused] failure traceback:\n%s", _tb.format_exc())
+                    logging.warning("[PD-AOS-focused] failure context: %s",
                                     _probe_failure_diagnostics(model, cur, ones, extra_args, gap_ctx))
                     break
             xs.append(cur)
@@ -6968,7 +7016,7 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             endgame = base_profile.get("endgame")
         if endgame is None and bool(cfg.get("probe_endgame", True)):
             _progress(callback, "cond_probe", "progress", len(grid), len(grid) + 4,
-                      "A-FloPS focused probe: endgame")
+                      "PD-AOS focused probe: endgame")
             endgame = _probe_endgame(model, extra_args, x0s[-1], grid[-1],
                                      pos_all, ones, space, _probe_gen(x))
         # Computed ONCE here so the profile dict below can carry BOTH the curve
@@ -6980,10 +7028,14 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         _cov_r = _lf_rescue_cov_curve(
             xs, x0s, grid, _eg_n_from_err(_endgame_eg_err(endgame)), 0.0)
         profile = {
-            "version": 7,
+            "version": 8,
             "cond_sig": cfg.get("cond_probe_sig"),
             "space": space,
             "n_probe_steps": m,
+            # WHAT THIS PROFILE WAS MEASURED AT, so the artefact describes itself.  `n_probe_steps` was
+            # already here; the RESOLUTION was not, which is why a run asking for 16 px consuming a 32 px
+            # measurement could not be seen in the log at all.  `pres` is the EFFECTIVE value.
+            "n_probe_res": int(pres),
             "sigma_curve": [round(v, 6) for v in grid],
             "jump_curve": [round(v, 6) for v in jumps],
             "gap_curve": [round(v, 6) for v in gap_curve],
@@ -6992,6 +7044,12 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             "med_local_err_real": (sorted(local_errs_real)[len(local_errs_real) // 2]
                                    if local_errs_real else 0.0),
             "curv_curve": [round(v, 6) for v in curvs],
+            # THE SIGMA EACH CURVATURE POINT IS ANCHORED AT.  The convention is documented at
+            # `aflops.py:7687` -- `curv_curve[k]` is the curvature at `sigma_curve[k+1]`, curves carry
+            # m-2 entries against the grid's m -- and a reader who does not know it will mis-align every
+            # derivation, as a rig of mine did this session.  Logging the anchors removes the need to
+            # know it.
+            "curv_sigma": [round(float(v), 6) for v in grid[1:1 + len(curvs)]],
             # PROBE-SIDE COVERAGE CURVE -- see the note on the model-probe copy.
             # This is the FOCUSED cond probe, i.e. the per-prompt one that runs
             # over the fragile band, so its curve is the most directly comparable
@@ -7057,7 +7115,7 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         profile["calib"] = _derive_cond_calibrations(profile, cfg)
         return profile
     except Exception as e:
-        logging.warning("[A-FloPS-focused] probe failed: %s", e)
+        logging.warning("[PD-AOS-focused] probe failed: %s", e)
         return None
 
 def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
@@ -7123,7 +7181,7 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             _shape_retry = False
             for i, s in enumerate(grid):
                 _progress(callback, "cond_probe", "progress", i, len(grid) + 4,
-                          "A-FloPS cond probe: step %d/%d" % (i + 1, len(grid)))
+                          "PD-AOS cond probe: step %d/%d" % (i + 1, len(grid)))
                 x0 = None
                 try:
                     x0 = _probe_model_call(model, cur, s * ones, extra_args)
@@ -7138,7 +7196,7 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                             if ones.device != _dev:
                                 ones = ones.to(_dev)
                             x0 = _probe_model_call(model, cur, s * ones, extra_args)
-                            logging.info("[A-FloPS-cond-probe] recovered from a "
+                            logging.info("[PD-AOS-cond-probe] recovered from a "
                                          "device mismatch at s=%.4g (model "
                                          "re-secured on %s)", s, _dev)
                         except Exception:
@@ -7148,15 +7206,15 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                                 and _is_shape_error(e)):
                             _shape_retry = True
                             logging.info(
-                                "[A-FloPS-cond-probe] model rejected a %d-D "
+                                "[PD-AOS-cond-probe] model rejected a %d-D "
                                 "probe latent at s=%.4g (%s); re-running the "
                                 "trajectory at %d-D",
                                 cur.dim(), s, e, _rank_ladder[_ladder_i + 1])
                             break
                         import traceback as _tb
-                        logging.warning("[A-FloPS-cond-probe] model call failed at s=%.4g: %s", s, e)
-                        logging.warning("[A-FloPS-cond-probe] failure traceback:\n%s", _tb.format_exc())
-                        logging.warning("[A-FloPS-cond-probe] failure context: %s",
+                        logging.warning("[PD-AOS-cond-probe] model call failed at s=%.4g: %s", s, e)
+                        logging.warning("[PD-AOS-cond-probe] failure traceback:\n%s", _tb.format_exc())
+                        logging.warning("[PD-AOS-cond-probe] failure context: %s",
                                         _probe_failure_diagnostics(model, cur, ones, extra_args, gap_ctx))
                         break
                 xs.append(cur)
@@ -7363,7 +7421,7 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         endgame = None
         if bool(cfg.get("probe_endgame", True)):
             _progress(callback, "cond_probe", "progress", len(grid), len(grid) + 4,
-                      "A-FloPS cond probe: endgame")
+                      "PD-AOS cond probe: endgame")
             endgame = _probe_endgame(model, extra_args, x0s[-1], grid[-1],
                                      pos_all, ones, space, _probe_gen(x))
         # Computed ONCE here so the profile dict below can carry BOTH the curve
@@ -7375,10 +7433,14 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         _cov_r = _lf_rescue_cov_curve(
             xs, x0s, grid, _eg_n_from_err(_endgame_eg_err(endgame)), 0.0)
         profile = {
-            "version": 7,
+            "version": 8,
             "cond_sig": cfg.get("cond_probe_sig"),
             "space": space,
             "n_probe_steps": m,
+            # WHAT THIS PROFILE WAS MEASURED AT, so the artefact describes itself.  `n_probe_steps` was
+            # already here; the RESOLUTION was not, which is why a run asking for 16 px consuming a 32 px
+            # measurement could not be seen in the log at all.  `pres` is the EFFECTIVE value.
+            "n_probe_res": int(pres),
             "sigma_curve": [round(v, 6) for v in grid],
             "jump_curve": [round(v, 6) for v in jumps],
             "gap_curve": [round(v, 6) for v in gap_curve],
@@ -7389,6 +7451,12 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             "med_local_err_real": (_pct(local_errs_real, 0.5)
                                    if local_errs_real else 0.0),
             "curv_curve": [round(v, 6) for v in curvs],
+            # THE SIGMA EACH CURVATURE POINT IS ANCHORED AT.  The convention is documented at
+            # `aflops.py:7687` -- `curv_curve[k]` is the curvature at `sigma_curve[k+1]`, curves carry
+            # m-2 entries against the grid's m -- and a reader who does not know it will mis-align every
+            # derivation, as a rig of mine did this session.  Logging the anchors removes the need to
+            # know it.
+            "curv_sigma": [round(float(v), 6) for v in grid[1:1 + len(curvs)]],
             # PROBE-SIDE COVERAGE CURVE.  The same statistic the rescue gate
             # consumes in the run (`frac`), computed along THIS probe trajectory
             # by the SAME function, so a pitfall like the coverage cliff can be
@@ -7466,7 +7534,7 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
         profile["calib"] = _derive_cond_calibrations(profile, cfg)
         return profile
     except Exception as e:
-        logging.warning("[A-FloPS-cond-probe] probe failed: %s", e)
+        logging.warning("[PD-AOS-cond-probe] probe failed: %s", e)
         return None
 
 def _apply_cond_probe_profile(cfg, cond_profile, tune, weight, auto_tunable):
@@ -8160,7 +8228,51 @@ ENGINE_DEFAULTS = {
     #
     # DEFAULT CHANGED TO 6.0 ON THE OPERATOR'S RULING, 2026-10-03 (it was 1.0, i.e. off).
     # This is ROUND LOG item 3, the release-defaults decision, and this is that decision.
-    "order_floor": 6.0,
+    # CHANGED TO 0.0 ON THE OPERATOR'S RULING, 2026-10-05: AUTOMATIC IS THE DEFAULT.  Basis: 26 judged
+    # prompts across two batches -- the error-gated automatic mode won 61 % of head-to-heads against the fixed
+    # demand and was NEVER his worst pick in the first eight, while the fixed demand is bimodal (best or worst,
+    # never middle).  1..6 remain the fixed demand; 0 means automatic.
+    "order_floor": 0.0,
+    # THE AUTOMATIC MODE'S DEMAND MAGNITUDE, now its OWN key.  It used to be read from `order_floor`, which was
+    # safe only while the default was 6 -- flipping the default to 0 would have set the demand to 0 and made
+    # AUTOMATIC inert without a single error message.  One key, one meaning.
+    "order_floor_adaptive_demand": 6.0,
+    # ---- THE GRADED DEMAND'S PARAMETERS, DERIVED FROM THE CORPUS (2026-10-05), NOT CHOSEN ----------------
+    # Measured on the gated runs (order_floor = 0, order_demand_q = 0): ABOVE the trigger the order the engine
+    # actually uses is p25 4.17 / p50 4.53 / p75 4.88 (240 steps), while AT OR BELOW it the usage is p25 1.81 /
+    # p50 2.41 / p75 2.85 (361 steps).  So (a) usage really does rise with the error, which is what makes a
+    # graded demand coherent, and (b) a flat demand of 6 asks for MORE order than the engine uses anywhere in
+    # the open region -- it over-asks at the bottom of that region and cannot differentiate at the top.
+    # lo/hi are the p25/p75 of that usage; r_hi is the p90 of the ratio above the trigger.
+    "order_floor_adaptive_graded": True,
+    "order_floor_adaptive_lo": 4.0,
+    "order_floor_adaptive_hi": 5.0,
+    # CHANGED 0.3031 -> 0.12 ON THE OPERATOR'S CLOSE-OUT RULING, 2026-10-05 (the "known good settings").
+    # Evidence: batch 6 ACCEPTED the r_hi = 0.12 cell and rejected the 0.3031 one ("your prediction was right,
+    # r_hi seems good"); batch 8 rated both well, so 0.12 has the better record; and on the corpus the 0.3031
+    # ramp reaches full strength on only ~10 % of its demanding steps against ~78 % for 0.12 -- it approaches a
+    # correct target lazily, and the accepted cell approaches it promptly.
+    "order_floor_adaptive_r_hi": 0.12,
+    # THE ADAPTIVE MODE'S THRESHOLD -- the only new constant this feature adds.  `order_floor = 0` means
+    # AUTOMATIC: demand the shipped order above while the run's own error is HIGH, and demand nothing once
+    # it settles.  The signal is the dimensionless `err/tol` the engine already computes every step, carried
+    # one step forward because step k's `err` is only known at the END of step k.
+    # THE VALUE IS MEASURED, NOT CHOSEN: on the operator's 16-prompt order_floor batch (build af9e1b8839,
+    # 768 step records) that ratio has median 0.0130, p75 0.0505, p90 0.2944, max 1.1582, and decays within
+    # a run (early 0.1433 -> mid 0.0553 -> late 0.0457).  p75 therefore means "demand the high order in the
+    # worst quarter of the steps", which acts early and releases -- the shape the operator's own read of the
+    # batch predicts.  PROVISIONAL BY CONSTRUCTION: the value in force is stamped per step
+    # (`ord_floor_rtol`), so a batch tests its neighbours instead of arguing about them.
+    "order_floor_adaptive_rtol": 0.05,
+    # THE BOUND-DERIVED REQUEST'S STRENGTH, and 0.0 IS OFF.  When `order_floor = 0` (AUTOMATIC) and this is
+    # above 0, the per-step request becomes the q-QUANTILE OF THE PER-PIXEL VALIDITY BOUND instead of the error
+    # gate's binary 6-or-1.  WHY THE BOUND, MEASURED: over 544 step records corr(`err/tol`, granted `ord_max`)
+    # is only +0.059 and flat across ratio thirds (4.34 / 4.47 / 4.50, median 5 in all three), so the ratio can
+    # say WHETHER to ask but not HOW MUCH -- while the bound IS the engine's own per-pixel answer to "what order
+    # is valid at this pixel's smoothness" (`_pixel_order_bound`, `aflops.py:10306`).  q = 0.5 is the median and
+    # the arm worth running first; q = 1.0 is the maximum, which is roughly what the fixed demand of 6 already
+    # asks for.  0.0-1.0 is a quantile's whole range.
+    "order_demand_q": 0.0,
     # WHICH CRITERION PICKS THE PER-PIXEL ORDER.  False (shipped) = the innovation argmin,
     # i.e. "the order whose extrapolation best PREDICTS x0".  True = the per-pixel Lagrange
     # remainder, i.e. "the HIGHEST order still valid at this pixel's own smoothness" -- the
@@ -8488,7 +8600,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             "guard and anomaly detector stay ON but run on ENGINE_DEFAULTS "
             "(untuned) thresholds.")
         if log_errors:
-            logging.info("[A-FloPS] STANDALONE MODE: no Autotuner connected, so no "
+            logging.info("[PD-AOS] STANDALONE MODE: no Autotuner connected, so no "
                          "probe evidence exists. Disabled the layers that REQUIRE "
                          "it: local field (lf_enable), dwell (dwell_mode), the "
                          "eta escape/fade auto-thresholds, and probe_tune_*. The "
@@ -8575,20 +8687,20 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                            "node_adopted" if probe_from_node
                            else "node_adopted_NOT_SERVING")
             if probe_from_node and log_errors:
-                logging.info("[A-FloPS-probe] using pre-computed profile "
+                logging.info("[PD-AOS-probe] using pre-computed profile "
                              "(node-side probe ran before the KSampler; "
                              "skip sampling-time probe)")
         if (profile is None or not probe_from_node
                 or bool(cfg.get("probe_force", False))):
             if log_errors:
-                logging.info("[A-FloPS-probe] running pre-profile pass "
+                logging.info("[PD-AOS-probe] running pre-profile pass "
                              "(%d steps @ %dx%d latent)",
                              int(cfg.get("probe_steps", 10)),
                              int(cfg.get("probe_resolution", 48)),
                              int(cfg.get("probe_resolution", 48)))
             _progress(callback, "probe", "start", 0,
                       int(cfg.get("probe_steps", 10)) + 4,
-                      "A-FloPS model probe")
+                      "PD-AOS model probe")
             _probe_model_cache_guard(model, True)
             _t_mp = _t0()
             try:
@@ -8606,14 +8718,14 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             _progress(callback, "probe", "end",
                       int(cfg.get("probe_steps", 10)) + 4,
                       int(cfg.get("probe_steps", 10)) + 4,
-                      "A-FloPS model probe done")
+                      "PD-AOS model probe done")
             if profile is not None:
                 _carry_run_feedback(profile, _PROBE_PROFILES.get(pkey))
                 _PROBE_PROFILES[pkey] = profile
                 _PROFILE_BY_MODEL[mk] = profile
                 _prune_probe_cache(mk, keep=8)
                 if log_errors:
-                    logging.info("[A-FloPS-probe] profile cached: distilled=%s "
+                    logging.info("[PD-AOS-probe] profile cached: distilled=%s "
                                  "safe_fresh_frac=%.3f med_jump=%.4f med_curv=%.4f",
                                  profile.get("is_distilled_eff"),
                                  profile.get("safe_fresh_frac", -1.0),
@@ -8644,7 +8756,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         mk = _model_cache_key(model)
         ckey = _cond_cache_key(cfg, extra_args, mk)
         if ckey is None and log_errors:
-            logging.info("[A-FloPS-cond-probe] no conditioning available to "
+            logging.info("[PD-AOS-cond-probe] no conditioning available to "
                          "fingerprint; profile cannot be cached")
         skey = None
         if ckey is not None:
@@ -8677,12 +8789,12 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             _phase_set("cond_probe_state",
                        "cached" if from_cache else "adopted_node")
             if log_errors:
-                logging.info("[A-FloPS-cond-probe] using cached per-prompt "
+                logging.info("[PD-AOS-cond-probe] using cached per-prompt "
                              "profile (model+prompt+schedule unchanged; "
                              "skip probe)")
         else:
             if log_errors:
-                logging.info("[A-FloPS-cond-probe] running per-prompt probe "
+                logging.info("[PD-AOS-cond-probe] running per-prompt probe "
                              "(%d steps @ %dx%d latent, weight=%.2f)",
                              int(cfg.get("cond_probe_steps", 4)),
                              int(cfg.get("cond_probe_resolution", 16)),
@@ -8690,7 +8802,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                              float(cfg.get("cond_probe_weight", 0.5)))
             _cond_K = int(cfg.get("cond_probe_steps", 4))
             _progress(callback, "cond_probe", "start", 0, _cond_K + 4,
-                      "A-FloPS cond probe")
+                      "PD-AOS cond probe")
             _probe_model_cache_guard(model, True)
             _t_cp = _t0()
             try:
@@ -8704,7 +8816,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                            "ran" if cond_profile is not None else "ran_EMPTY")
                 _probe_model_cache_guard(model, False)
             _progress(callback, "cond_probe", "end", _cond_K + 4, _cond_K + 4,
-                      "A-FloPS cond probe done")
+                      "PD-AOS cond probe done")
             if cond_profile is not None and cond_profile.get("gap") is None \
                     and ckey is not None:
                 _prev_gap = (_COND_PROBE_PROFILES.get(ckey) or {}).get("gap")
@@ -8740,7 +8852,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             if log_errors:
                 gap = cond_profile.get("gap")
                 ts = cond_profile.get("trajectory_state", {})
-                logging.info("[A-FloPS-cond-probe] profile ready: "
+                logging.info("[PD-AOS-cond-probe] profile ready: "
                              "distilled=%s med_jump=%.4f med_curv=%.4f "
                              "med_err=%.4f gap=%s "
                              "oversteer=%.3f oversmooth=%.3f "
@@ -8816,7 +8928,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                         distilled_mode=_probe_distilled_mode(cfg))
                     if _focused_grid and len(_focused_grid) >= 4:
                         if log_errors:
-                            logging.info("[A-FloPS-focused] running focused "
+                            logging.info("[PD-AOS-focused] running focused "
                                          "cond probe (%d points, %d fragile "
                                          "ranges: %s)",
                                          len(_focused_grid), len(_fragile),
@@ -8825,7 +8937,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                         _fp_total = len(_focused_grid)
                         _progress(callback, "cond_probe", "start", 0,
                                   _fp_total,
-                                  "A-FloPS focused cond probe")
+                                  "PD-AOS focused cond probe")
                         _probe_model_cache_guard(model, True)
                         try:
                             _focused_prof = _run_focused_cond_probe(
@@ -8839,7 +8951,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                             _probe_model_cache_guard(model, False)
                         _progress(callback, "cond_probe", "end",
                                   _fp_total, _fp_total,
-                                  "A-FloPS focused cond probe done")
+                                  "PD-AOS focused cond probe done")
                         if _focused_prof is not None and _focused_key is not None:
                             _carry_run_feedback(
                                 _focused_prof,
@@ -8853,7 +8965,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                     lf_prof_c = _focused_prof
                     if log_errors:
                         ts = _focused_prof.get("trajectory_state", {})
-                        logging.info("[A-FloPS-focused] profile ready: "
+                        logging.info("[PD-AOS-focused] profile ready: "
                                      "oversteer=%.3f oversmooth=%.3f "
                                      "med_err=%.4f n_steps=%d",
                                      ts.get("oversteer", 0.0),
@@ -8862,7 +8974,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                                      _focused_prof.get("n_probe_steps", 0))
         except Exception as e:
             if log_errors:
-                logging.warning("[A-FloPS-focused] probe skipped: %s", e)
+                logging.warning("[PD-AOS-focused] probe skipped: %s", e)
     eta_base = 0.0 if cfg["eta"] is None else float(cfg["eta"])
     space_mode = cfg["extrap_space"]
     adaptive_on = bool(cfg.get("order_pixel_adaptive", True))
@@ -9021,7 +9133,34 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         _eg_dir = 1.0
     _eg_dir = max(-1.0, min(1.0, _eg_dir))
     # the forced per-pixel order floor (see ENGINE_DEFAULTS): read once per run, not per step
-    _order_floor = float(cfg.get("order_floor", 1.0) or 1.0)
+    # `or 1.0` WOULD SWALLOW THE ADAPTIVE MODE: `0 or 1.0` is 1.0, so `order_floor = 0` would read back
+    # as 1 and the widget would be wired to nothing.  Explicit None check instead (rule 12's class: the value
+    # that reaches the decision, not the one that was asked for).
+    # THE FALLBACK IS THE SHIPPED DEFAULT, not a hard-coded 1.0: a caller that omits the key must get the same
+    # behaviour as the UI default, or the two silently disagree (one default, one source).
+    _of_raw = cfg.get("order_floor", ENGINE_DEFAULTS.get("order_floor", 0.0))
+    _order_floor = float(1.0 if _of_raw is None else _of_raw)
+    # `order_floor = 0` = AUTOMATIC.  `_prev_rtol` is seeded here and carried at the end of every step next
+    # to `prev_err`, so the gate reads the LAST MEASURED ratio and never a fabricated one.
+    _order_floor_auto = bool(_order_floor <= 0.0)
+    _order_floor_demand = float(ENGINE_DEFAULTS.get("order_floor_adaptive_demand", 6.0))
+    # THE GRADED CURVE'S KNOBS.  `graded=False` restores the previous flat demand exactly, which is what makes
+    # the two comparable in one A/B without a code change.
+    _of_graded = bool(cfg.get("order_floor_adaptive_graded",
+                              ENGINE_DEFAULTS.get("order_floor_adaptive_graded", True)))
+    _of_lo = float(cfg.get("order_floor_adaptive_lo",
+                           ENGINE_DEFAULTS.get("order_floor_adaptive_lo", 4.0)))
+    _of_hi = float(cfg.get("order_floor_adaptive_hi",
+                           ENGINE_DEFAULTS.get("order_floor_adaptive_hi", 5.0)))
+    _of_r_hi = float(cfg.get("order_floor_adaptive_r_hi",
+                             ENGINE_DEFAULTS.get("order_floor_adaptive_r_hi", 0.3031)))
+    _order_floor_rtol = float(cfg.get("order_floor_adaptive_rtol",
+                                      ENGINE_DEFAULTS.get("order_floor_adaptive_rtol", 0.05)))
+    # `order_demand_q > 0` selects the BOUND-DERIVED request for the automatic mode (see ENGINE_DEFAULTS).
+    _order_demand_q = float(cfg.get("order_demand_q",
+                                    ENGINE_DEFAULTS.get("order_demand_q", 0.0)) or 0.0)
+    _order_demand_q = max(0.0, min(1.0, _order_demand_q))
+    _prev_rtol = None
     # which criterion picks the per-pixel order, and the tolerance the remainder bound is
     # compared against -- the SAME tolerance the order gate uses, so the two agree
     _order_by_bound = bool(cfg.get("order_by_bound", False))
@@ -9054,7 +9193,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         _lam_min_steps = _recommend_lam_clamp_from_profile(
             lf_prof_m, lf_prof_c, sigmas)
         if _lam_min_steps is not None:
-            logging.info("[A-FloPS] probe-driven lam clamp: per-step lower "
+            logging.info("[PD-AOS] probe-driven lam clamp: per-step lower "
                          "bound %.2f .. %.2f (anchor %.2f, headroom %.2f); "
                          "distilled/no-evidence models keep the fixed bound",
                          min(_lam_min_steps), max(_lam_min_steps),
@@ -9216,7 +9355,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             _rs, _rf = _rescue_window_from_fragile(sigmas, _fragile)
             if _rs is not None:
                 if log_errors:
-                    logging.info("[A-FloPS-lf] rescue window placed from "
+                    logging.info("[PD-AOS-lf] rescue window placed from "
                                  "endgame evidence: start=%.3f full=%.3f",
                                  _rs, _rf)
                 _lf_rescue["start"] = _rs
@@ -9256,17 +9395,17 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 dwell_fade = float(_dw["fade_end"])
                 if log_errors:
                     logging.info(
-                        "[A-FloPS-dwell] adopted: max=%.3f ramp_end=%.2f "
+                        "[PD-AOS-dwell] adopted: max=%.3f ramp_end=%.2f "
                         "fade_end=%.2f (oversteer=%.3f, source=%s)",
                         dwell_max, float(_dw["ramp_end"]), dwell_fade,
                         float(_dw["ov"]), lf_evid.get("source", "?"))
             elif log_errors:
-                logging.info("[A-FloPS-dwell] off: no qualifying probe "
+                logging.info("[PD-AOS-dwell] off: no qualifying probe "
                              "evidence (oversteer below gate or no usable "
                              "curvature curve)")
         except Exception as e:
             if log_errors:
-                logging.warning("[A-FloPS-dwell] skipped: %s", e)
+                logging.warning("[PD-AOS-dwell] skipped: %s", e)
     dwell_on = dwell_max > 1e-3 and n_cand >= 6
     dwell_ramp = 0.30
     dwell_fade_start = 1.0
@@ -9278,7 +9417,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                          "ramp_end": round(dwell_ramp, 4),
                          "fade_end": round(dwell_fade, 4)}
         if log_errors and _dwell_mode == "manual":
-            logging.info("[A-FloPS-dwell] manual: max=%.3f fade_end=%.2f",
+            logging.info("[PD-AOS-dwell] manual: max=%.3f fade_end=%.2f",
                          dwell_max, dwell_fade)
     elif _dwell_mode != "off":
         cfg["_dwell"] = {"mode": _dwell_mode, "adopted": False}
@@ -9377,7 +9516,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                  # the `wc:` collision was invisible in the log for exactly as long as it took to
                  # think of looking.
                  "_model_key_kind": _MODEL_KEY_KIND,
-                 # WHERE THIS RUN'S WALL TIME WENT.  A-FloPS logged no timing at
+                 # WHERE THIS RUN'S WALL TIME WENT.  PD-AOS logged no timing at
                  # all before this, so "the probes feel slow" could not be
                  # answered from the corpus.  Milliseconds per phase, plus the
                  # probe cache states and the number of probe forward passes the
@@ -9394,7 +9533,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                  #
                  # MEASURED ON THE OPERATOR'S FIRST RUN OF THIS INSTRUMENTATION:
                  # `model_key_ms` was 6057 ms and 6386 ms per queue -- 32-51 % of
-                 # the whole pre-sampling window.  A-FloPS had no timing at all
+                 # the whole pre-sampling window.  PD-AOS had no timing at all
                  # before this, so a 6-second-per-queue cost in the one function
                  # whose docstring promised "bounded work" was invisible for as
                  # long as it took to build this record.
@@ -9514,7 +9653,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                  "cfg": {k: v for k, v in cfg.items() if k != "_model_info"}}
     if log_errors and lf_on:
         logging.info(
-            "[A-FloPS] local schedule field auto-tuned from probe "
+            "[PD-AOS] local schedule field auto-tuned from probe "
             "discovery (%s: oversteer=%.2f oversmooth=%.2f err=%.4f "
             "spike=%.2f distilled=%s -> strength=%.2f volatility=%.2f "
             "detail=%.2f resharpen=%.2f clamp=%.2f drift=%.2f | v3: n=%s "
@@ -9533,7 +9672,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     elif (log_errors and not lf_on and bool(cfg.get("lf_enable", True))
           and lf_evid is not None and lf_evid.get("source") == "none"):
         logging.info(
-            "[A-FloPS] local schedule field OFF: no probe evidence "
+            "[PD-AOS] local schedule field OFF: no probe evidence "
             "(the field is automatic-only; enable the Model Probe or "
             "Cond Probe so its gains can be derived -- it never runs on "
             "guessed defaults)")
@@ -9576,7 +9715,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 raise
             if _mopt is not None:
                 ea2["model_options"] = _mopt
-            logging.warning("[A-FloPS] model call failed (%s: %s); retrying "
+            logging.warning("[PD-AOS] model call failed (%s: %s); retrying "
                             "with the model's internal caches disabled for "
                             "the rest of this run", type(e).__name__, e)
             _run_caches_off[0] = True
@@ -10268,9 +10407,39 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             # branches, before the allowed-ladder maps anything down -- so it is a demand
             # that the safety path can still refuse, not an override.  A pixel `reset_m`
             # snapped to 1 stays at 1.
-            if _order_floor > 1.0:
+            # ONE DEMAND PATH FOR BOTH MODES.  `1..6` demand their own value on every step, exactly as before;
+            # `0` (AUTOMATIC) demands the shipped order only while the run's last-measured `err/tol` is above
+            # the threshold.  Applied in BOTH branches and before the allowed-ladder maps anything down, so it
+            # stays a DEMAND the safety path can refuse -- the property `notes/038` established, inherited.
+            _fl_val = _order_floor
+            if _order_floor_auto:
+                if _order_demand_q > 0.0 and _order_by_bound:
+                    # THE BOUND-DERIVED REQUEST.  With `order_by_bound` in force `o_new` IS the per-pixel
+                    # bound (`aflops.py:10306-10310`), so this asks for the q-quantile of what the engine
+                    # itself considers valid for THIS step -- the same question the fixed demand asks, at the
+                    # step's own scale, and needing no new quantity and no extra pass.
+                    try:
+                        _ok = o_new[~reset_m] if reset_m is not None else o_new
+                        _ok = _ok.reshape(-1)
+                        _fl_val = (float(torch.quantile(_ok.float(), _order_demand_q))
+                                   if _ok.numel() else _order_floor_demand)
+                        _ab_hit("order.demand_bound.applied", round(float(_fl_val), 4))
+                    except Exception:
+                        _fl_val = _order_floor_demand
+                else:
+                    _gate_open = bool(_prev_rtol is not None
+                                      and _prev_rtol > _order_floor_rtol)
+                    # ONE OWNER (`_graded_demand`), called identically by the stamp below.
+                    _fl_val = _graded_demand(_prev_rtol, _order_floor_rtol, _of_lo, _of_hi,
+                                             _of_r_hi, _order_floor_demand, _of_graded)
+                # REACHABILITY (rule 9): the site counts its own invocations, so a batch can prove the gate RAN
+                # rather than infer it from an effect.
+                    _ab_hit("order.floor_adaptive.open" if _gate_open
+                            else "order.floor_adaptive.shut",
+                            None if _prev_rtol is None else round(float(_prev_rtol), 6))
+            if _fl_val > 1.0:
                 try:
-                    _fl = torch.full_like(o_new, min(float(_order_floor),
+                    _fl = torch.full_like(o_new, min(float(_fl_val),
                                                      float(max(P, 2))))
                     _ord_floor_n = int(((o_new < _fl) & ~reset_m).sum())
                     o_new = torch.where(reset_m, torch.ones_like(o_new),
@@ -10884,7 +11053,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                     dwell_on = False
                     dw_w = None
                     if log_errors:
-                        logging.warning("[A-FloPS-dwell] disabled for this "
+                        logging.warning("[PD-AOS-dwell] disabled for this "
                                         "run: %s", e)
         if s_up > 0:
             override_beta = None
@@ -11009,7 +11178,26 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             _raw["ord_bfix"] = _ord_bound.get("bound_fix")
         # The forced floor's own record: the value in force and how many pixels it raised.
         # `order_floor` is in the cfg dump, but a per-step count is what shows it ACTED.
-        if _order_floor > 1.0:
+        if _order_floor_auto:
+            # WHICH POLICY SET THE LEVEL, and its strength -- so a corpus reader never infers the request
+            # from a config dump (the `cond_rtol_loosen` lesson).
+            _raw["ord_demand_q"] = _order_demand_q
+            _raw["ord_demand_policy"] = ("bound" if _order_demand_q > 0.0
+                                         else ("graded" if _of_graded else "flat"))
+            # WHAT THE GATE DECIDED THIS STEP, recomputed from the same two inputs the demand used, so the
+            # record cannot disagree with the maths even on a step where the ladder never ran.  The fixed
+            # modes stamp EXACTLY what they stamped before: this branch is new, that one is untouched.
+            _gate_rec = bool(_prev_rtol is not None and _prev_rtol > _order_floor_rtol)
+            # THE SAME FUNCTION THE DEMAND SITE USED, so the record cannot disagree with the maths (the dynamic
+            # rig checks exactly this equality for every step).
+            _raw["ord_floor"] = _graded_demand(_prev_rtol, _order_floor_rtol, _of_lo, _of_hi,
+                                               _of_r_hi, _order_floor_demand, _of_graded)
+            _raw["ord_floor_px"] = _ord_floor_n
+            _raw["ord_floor_gate"] = _gate_rec
+            _raw["ord_floor_rtol"] = _order_floor_rtol
+            _raw["ord_floor_prev_ratio"] = (None if _prev_rtol is None
+                                            else round(float(_prev_rtol), 6))
+        elif _order_floor > 1.0:
             _raw["ord_floor"] = _order_floor
             _raw["ord_floor_px"] = _ord_floor_n
         if _wgate_info is not None:
@@ -11017,6 +11205,14 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             _raw["wtol"] = round(float(_wgate_info["tol_eff"]), 9)
             _raw["wgate_k"] = int(_wgate_info["k"])
             _raw["wgeom"] = float(_wgate_info["geom"])
+        # THE ADAPTIVE ORDER GATE'S INPUT, computed where BOTH err and tol are live -- they are the same
+        # two values the step record logs, so the gate's input is exactly the number a corpus reader
+        # sees.  err/tol is dimensionless, so ONE threshold transfers across models and schedules; it is
+        # carried one step forward because this step's err only exists here.  NO try/except: a silent
+        # guard at the first site hid a NameError and held the gate shut on every step, even at 1e-9.
+        # THE NAME MUST MATCH THE GATE'S (`_prev_rtol`): the first version wrote `prev_rtol` here while the
+        # gate read `_prev_rtol`, so the gate read a variable nothing assigned and never opened.
+        _prev_rtol = (None if (err is None or not tol) else float(err) / float(tol))
         if len(_LAST_ERRORS) < 64 or log_errors:
             _LAST_ERRORS.append({"mode": "engine", "step": k,
                                  "sigma": round(s, 6), "sigma_next": round(sn, 6),
@@ -11105,7 +11301,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         if log_errors:
             _nb = (noise_sampler.last_beta if noise_sampler is not None and
                    hasattr(noise_sampler, "last_beta") else None)
-            logging.info("[A-FloPS] k=%d sigma=%.4f err=%s tol=%.4g ord=%d "
+            logging.info("[PD-AOS] k=%d sigma=%.4f err=%s tol=%.4g ord=%d "
                          "guard=%s an=%s corr=%s eta=%.3f nb=%s lam=%s calls=%d"
                          " hcos=%s ec=%d bw=%s",
                          k, s, "n/a" if err is None else f"{err:.4g}", tol, eff,
@@ -11120,7 +11316,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         if callback is not None and not disable:
             callback({"x": x, "denoised": x0, "i": k, "sigma": sigmas[i], "sigma_hat": sigmas[i]})
             _progress(callback, "step", "progress", k, n_cand,
-                      "A-FloPS sampling: step %d/%d" % (k, n_cand),
+                      "PD-AOS sampling: step %d/%d" % (k, n_cand),
                       extra={"value": k, "total": n_cand})
     try:
         if (lf_dir_acc[1] > 0
@@ -11140,7 +11336,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 _lst.append(_dir_val)
                 del _lst[:-5]
             if log_errors and _profs:
-                logging.info("[A-FloPS-lf] run direction feedback: "
+                logging.info("[PD-AOS-lf] run direction feedback: "
                              "dir_real=%.3f (%d steps measured)",
                              _dir_val, lf_dir_acc[1])
     except Exception:

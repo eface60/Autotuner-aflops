@@ -1,4 +1,4 @@
-# A-FloPS Sampler for ComfyUI
+# PD-AOS Sampler for ComfyUI
 
 An adaptive sampler. Before it samples anything, it measures the model and your
 prompt with two small probe passes, and then uses those measurements to:
@@ -32,7 +32,7 @@ Copy this folder into `ComfyUI/custom_nodes/` and restart ComfyUI.
 
 ## Nodes
 
-### A-FloPS Autotuner (probe + schedule)
+### PD-AOS Autotuner (probe + schedule)
 
 - Inputs: `guider` (the guider your run uses), `sigmas` (any scheduler's output).
 - Outputs: `sigmas` (fine-tuned) and `options` (connect this to the Sampler's
@@ -48,40 +48,56 @@ Copy this folder into `ComfyUI/custom_nodes/` and restart ComfyUI.
 | `warp` | Moves the sigma values themselves, leaving the first and last where they are. 1.00 keeps your schedule as it is. Below 1.00 reaches low noise sooner. |
 | `auto_warp` | ON: the `warp` setting is ignored and the strongest safe value is chosen for you. OFF: your `warp` value is used as set. |
 
-### A-FloPS Sampler
+### PD-AOS Sampler
 
 | setting | what it does |
 |---|---|
 | `log_errors` | Writes what the sampler decides at every step to the console, and fills the Error Report node. For testing. |
 
-Inputs: `model` is optional - connecting it lets the sampler read the model's type
-and settings directly. `options+` takes the Autotuner's `options` output, or an
-**A-FloPS Debug Options** node (below), and the sampler obeys whatever it is told.
+**That is the only setting on this node.** The switches that used to sit here — `lf_ab`, `order_by_bound`,
+`order_floor`, `an_enable` and `wmax_eg_dir` — have each reached a decision, so they are no longer exposed
+anywhere: **the engine defaults ARE the decided values**, and the evidence behind each one is in
+`CONSTANTS_AUDIT.md` and `DEAD_FEATURES.md`.
 
-The sampler's own behaviour switches are grouped onto the Debug Options node so that
-one node can drive every run of a graph. A workflow saved with the older settings on
-the sampler itself keeps working: those inputs are still honoured.
+### PD-AOS Debug Options (the automatic order demand)
 
-### A-FloPS Debug Options (the switches)
+**This node carries one system: the automatic order demand** — how hard the sampler asks itself to follow the
+trajectory. The switches it used to carry are settled and gone from the UI; their values and evidence are the
+"Settled settings" table below, so nothing is lost by removing them.
 
-Connect its `options` output to the Sampler's `options+`. It also accepts `options+`
-itself, so several options nodes can be chained - the one closest to the sampler wins
-wherever two of them set the same thing.
+This node also has an **`options+` input of its own**, so it can be **chained** with another options
+node — for example the Autotuner's `options` output into this node, and this node's `options` output
+into the Sampler. Fields from the upstream node pass through untouched; where two nodes set the same
+field, the one **closest to the Sampler** wins.
 
-| setting | what it does |
-|---|---|
-| `lf_ab` | Turns the local field on or off. **ON is the shipped default.** ON: the sampler also makes small local corrections where its own step is least reliable. OFF: no local corrections. |
-| `order_by_bound` | Chooses how the per-pixel order is picked. OFF: the number of previous steps that predicts the next one best. ON: the highest number of previous steps that is still safe for that pixel, so smooth areas look further ahead and busy areas do not. **ON is the shipped default.** It pairs with `order_floor`: the setting below is what the sampler is allowed to raise the order *to*. |
-| `order_floor` | The lowest order the sampler may use, per pixel. 1 means the sampler decides by itself. Numbers above 1 push every pixel up to at least that value, which makes the sampler follow the direction of the trajectory harder. **6 is the shipped default**, paired with `order_by_bound` on. **Note what that combination costs:** measured on one prompt, one seed and one build, raising this from 1 to 6 nearly doubled the sampler's own final-step error (0.060-0.063 to 0.113-0.128, with no overlap between the two groups) and lowered the final image's gradient. That measurement scores distance to an exact solution, not how an image looks, and the shipped default follows the maintainer's eye across many runs rather than that number. Set it to 1 to let the sampler decide entirely on its own, or to `1` with `order_by_bound` off for the most conservative behaviour. |
-| `an_enable` | Turns the anomaly detector on or off. **ON is the shipped default.** ON: at each step the sampler looks for a few pixels whose local change is far outside their own neighbourhood - an abrupt, spatially concentrated event - and damps the local field's correction on that small region for the next several steps. OFF: that detection never runs and nothing is damped. Decided ON by the maintainer's own A/B: there are prompts where it does not fire, but where it does, it fixes things regular sampling does not recover from in time. |
-| `wmax_eg_dir` | Which way the sampler reacts when its own end-of-run error measurement comes out **high**. `0` (shipped default) = no reaction; the error-based limit acts alone. `+1` = it allows the most extrapolation then. `-1` = it does the **opposite** and allows the least extrapolation then. This setting decides **which pixels** get the higher extrapolation order, so it changes the **structure** of the image more than its overall detail or sharpness. Measured: `-1` is worse than `+1` against an exact ODE solution on three analytic flows (by up to 47%). **The live range is `-1` to `0`**: `+0.5` and `+1` behave the same as each other because the error-feedback loop that used to separate them has been removed, and the response saturates above an effective limit of about 3.8. |
-| `ord_ema` | How fast the sampler forgets its own recent innovation estimate. It blends the previous estimate with the newest sample: `0.0` ignores the history and follows the newest sample, `1.0` never moves, and the **shipped `0.37` leans on the newest sample.** Higher is steadier and slower to react; lower is twitchier. **The range is not arbitrary** - it is a blend weight between two things. **Grounded, and the shipped value IS the measured optimum:** the sampler's own logged innovation series (n=682) has step-to-step correlation 0.630, which puts the best-fitting value at 0.370. It shipped at 0.5 - 0.13 stiffer than the measurement wants - until a controlled A/B settled it: one session, one prompt, one seed at 0.5 / 0.37 / 0.5 gave a **bit-identical** replicate pair and a 33 % change on the `0.37` arm, and `0.37` looked better. |
-| `cond_rtol_loosen` | **Experimental, and honest about it.** Scales the tolerance derived from the **prompt** probe. `1.5` reproduces the shipped behaviour, `1.0` switches that loosening off, below `1.0` tightens. It is measured **inert in practice**: across 31 runs on two models the tolerance those runs actually consumed never moved. It is here because a knob that is not reachable cannot be tested. |
+**Disconnected, the Sampler uses the engine defaults, and those ARE the decided values** — the
+defaults on this node are read from the engine rather than repeated, so the two cannot drift apart.
 
-Both order settings still obey the safety rules described above, and a pixel the
-sampler has just reset stays at order 1.
+| setting | shipped | what it does |
+|---|---|---|
+| `order_floor` | **0** (AUTOMATIC) | `0` = ask for the high order only while the run's **own measured error** is high, then let go. It is the shipped default because it **won 61 % of head-to-heads** against a fixed demand across 26 judged prompts and was never the worst pick. `1` = the sampler always decides by itself. `2`–`6` = ask for at least that many previous steps per pixel — a **request the safety path may refuse**. **Measured: the order actually used caps at 5** (8,362 step records, every arm and every build), so a demand of `6` cannot raise the maximum and the mean rises only a little above `5`. |
+| `order_floor_adaptive_rtol` | **0.05** | The **flip point**: the automatic demand acts while the step's error over its tolerance is above this, and asks for nothing below it. Grounded on 768 step records — that ratio's p75 is 0.0505, so the shipped value demands in roughly the worst quarter of the steps. |
+| `order_floor_adaptive_graded` | **ON** | ON: the order asked for **scales with the error** (about 4 at the bottom of the gate's range, 5 near the top). OFF: the previous behaviour exactly — a flat demand of 6 whenever the gate is open — which is what makes the two comparable in one test. |
+| `order_floor_adaptive_lo` | **4** | The order the automatic mode asks for at the **bottom** of the gate's error range. **Derived, not chosen:** above the gate's trigger the order the engine actually uses is p25 4.17 / p50 4.53 / p75 4.88. Setting `lo` equal to `hi` gives a flat demand at that level. |
+| `order_floor_adaptive_hi` | **5** | The order it asks for at the **top** of the error range. **`hi = 5` is the realised ceiling of the whole engine** — measured over 8,362 step records, across every arm and every build, the order actually used never exceeds 5 — so raising `hi` above 5 cannot raise the maximum, and the mean order only rises a little (going 4 → 5 buys +0.79 of mean order, 5 → 6 buys +0.21). |
+| `order_floor_adaptive_r_hi` | **0.12** | How fast the ramp reaches `hi` — the error ratio at which the demand stops rising. The previously shipped `0.3031` reached full strength on only **~10 %** of its demanding steps against **~78 %** for `0.12`, and the `0.12` cell is the one the maintainer accepted by eye. |
+| `order_demand_q` | **0** (off) | A per-pixel bound-derived request. **Measured not to do what it claims:** on the harness it produced a binary request rather than a graded one, asking for 6 on steps whose own ceiling was 3–5. `0` is the only verified setting. |
 
-### A-FloPS Error Report
+### Settled settings (no widget; frozen in the engine defaults)
+
+Each was decided by measurement plus the maintainer's eye, and each now lives only as an engine default. They are
+listed so the public record survives the removal of their widgets.
+
+| setting | value | why it is settled |
+|---|---|---|
+| `lf_ab` (`lf_enable`) | ON | preferred by eye on the LF × ORDER 2×2 |
+| `order_by_bound` | ON | release ruling; picks each pixel's order by the highest count that is still safe |
+| `an_enable` | ON | his own A/B: where the anomaly detector fires, it fixes what ordinary sampling does not recover from in time |
+| `wmax_eg_dir` | 0 | the error-direction reaction; the negative side measured worse against an exact solution |
+| `cond_rtol_loosen` | 1.5 | **measured inert** across 31 runs on two models — the consumed tolerance never moved |
+| `ord_ema` | 0.37 | the **measured optimum**: alpha* = 1 − rho_1 = 0.370 on its own logged innovation series |
+
+### PD-AOS Error Report
 
 Optional. Writes the sampler's per-step decisions to a JSON file.
 
@@ -94,44 +110,24 @@ per step. They are not needed for normal use.
 
 ## Wiring
 
-![Wiring example: BasicScheduler -> A-FloPS Autotuner -> the A-FloPS Sampler -> SamplerCustomAdvanced](docs/wiring-example.png)
+![Wiring example: BasicScheduler → PD-AOS Autotuner → the PD-AOS Sampler → SamplerCustomAdvanced](docs/wiring-example.png)
 
 1. Build a normal `SamplerCustomAdvanced` graph (model, noise, guider, sampler,
    sigmas).
-2. Add **A-FloPS Autotuner**: connect your guider to `guider`, and your scheduler's
+2. Add **PD-AOS Autotuner**: connect your guider to `guider`, and your scheduler's
    output (for example BasicScheduler "simple") to `sigmas`.
 3. Connect the Autotuner's `sigmas` output to `SamplerCustomAdvanced.sigmas`.
-4. Add **A-FloPS Sampler**: connect the Autotuner's `options` output to its
+4. Add **PD-AOS Sampler**: connect the Autotuner's `options` output to its
    `options+` input, and its `sampler` output to `SamplerCustomAdvanced.sampler`.
    The Sampler's own `model` input is optional: connecting the model there lets it
    read the model's type and settings directly. The Autotuner needs no such input,
    because it receives the model through the guider.
-5. Optional: add **A-FloPS Debug Options** and chain it in front of the Sampler
-   (Autotuner `options` -> Debug Options `options+`, Debug Options `options` ->
-   Sampler `options+`) when you want the behaviour switches on a node of their own.
-   With it unconnected, every switch sits at its shipped default.
-6. Run. The first generation probes the model and the prompt and stores the
+5. Run. The first generation probes the model and the prompt and stores the
    measurements; later generations with the same model and settings reuse them.
 
-The steps above are the wiring. The screenshot was taken with the shipped defaults
-(`order_by_bound` on, `order_floor` at 6, `lf_ab` on, `auto_warp` on); in a graph
-saved before this release, those switches sit on the Sampler node rather than on the
-Debug Options node.
-
-## What changed in this release
-
-- **The five finished switches moved off the Sampler onto a new `A-FloPS Debug
-  Options` node** (`lf_ab`, `order_by_bound`, `order_floor`, `an_enable`,
-  `wmax_eg_dir`). Saved workflows keep working: the Sampler still honours its old
-  inputs, and no saved value moves to a different setting. `an_enable` is new to the
-  interface.
-- **`ord_ema` ships at 0.37** instead of 0.5 - the measured optimum, and the value
-  the maintainer's eye preferred in a controlled A/B. It lives on the Debug Options
-  node.
-- **The Sampler node now shows a single setting**, `log_errors`.
-- Engine-side: the per-pixel order criterion no longer carries two thresholds its
-  own measurements could never reach, and a set of dead code paths was removed. Both
-  are behaviour-identical on the models tested.
+The screenshot above is that graph for a 16-step run, with `auto_warp` on and the Debug Options
+node left disconnected — i.e. the engine defaults, with `order_floor` at 0 (AUTOMATIC), which is
+what the engine defaults give.
 
 ## Notes
 
@@ -143,9 +139,9 @@ Debug Options node.
 - **The first run costs more than later ones**, because of the model probe. It is
   cached per model, settings and schedule, so it is paid once per model
   configuration rather than once per generation.
-- **A couple of the Debug Options settings are experimental.** They say so in their
-  own tooltips, together with what has been measured about them, rather than being
-  hidden.
+- **A few experimental switches exist in the code but are not shown in the node
+  interface.** They are fixed at their shipped values. They are not described here
+  because they are not proven.
 - **The noise control was removed.** It was measured to have no effect on the
   output on the models we tested, so the setting is gone rather than left in place
   doing nothing.
