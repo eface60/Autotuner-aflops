@@ -38,28 +38,20 @@ import math
 import torch
 
 
-_FLUX_CLASS = "ModelSamplingFlux"
+# `_FLUX_CLASS` WAS REMOVED 2026-10-04, one step after the function that read it: deleting
+# `_flow_time_of_sigma` orphaned this constant, and the sweep's own census flagged it on the next run.
+# Flux goes through the generic `ms.timestep` branch of `_sigma_of_flow_time` below.
 _COSMOS_CLASS = "ModelSamplingCosmosRFlow"
 
 
 # ---------------------------------------------------------------------------
-# sigma <-> model-flow-time map (used by the companion scheduling node)
+# sigma <- model-flow-time map, used by the companion scheduling node through
+# `_sigma_of_flow_time` (called below at `_uniform_flow_time_sigmas`).
+# THE INVERSE, `_flow_time_of_sigma`, WAS REMOVED 2026-10-04 by the dead-code
+# sweep: nothing called it -- no schedule, no node, no rig -- while its own
+# docstring claimed the scheduling node used it (rule 26: a stale comment reads
+# as current truth).
 # ---------------------------------------------------------------------------
-def _flow_time_of_sigma(ms, sigma):
-    """Model flow time tau (clean=0 .. noise=tau_max) for a sigma."""
-    cls = type(ms).__name__
-    sigma = float(sigma)
-    if cls == _FLUX_CLASS:
-        e = math.exp(float(getattr(ms, "shift", 1.15)))
-        return sigma / (e * (1.0 - sigma) + sigma)
-    if cls == _COSMOS_CLASS:
-        return sigma / (sigma + 1.0)
-    try:  # generic: model's own inverse map
-        return float(ms.timestep(torch.tensor(sigma)))
-    except Exception:
-        return sigma / (sigma + 1.0)
-
-
 def _sigma_of_flow_time(ms, tau):
     cls = type(ms).__name__
     tau = float(tau)

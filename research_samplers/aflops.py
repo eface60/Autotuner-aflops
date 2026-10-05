@@ -160,16 +160,6 @@ def _phase_set(key, value):
         pass
 
 
-def _phase_round():
-    """A JSON-safe copy (rule 8: log enough precision for the decision to be
-    auditable -- ms to 3 decimals is microseconds)."""
-    out = {}
-    for k, v in _PHASE_MS.items():
-        try:
-            out[k] = round(float(v), 3)
-        except Exception:
-            out[k] = v
-    return out
 _PROBE_PROFILES = {}       # "<model_key>|s:<sched_hash>" -> profile
 _PROFILE_BY_MODEL = {}     # "<model_key>" -> most recent profile (scheduler view)
 _COND_PROBE_PROFILES = {}  # (model_key, cond_sig) -> per-prompt profile
@@ -1315,6 +1305,17 @@ def _schedule_sig(x, sigmas, cfg):
         h.update(("osm=%s,ev=%s" % (
             str(cfg.get("_osm_ab_mode", "engine") or "engine"),
             str(cfg.get("_ev_ab_mode", "engine") or "engine"))).encode())
+        # `wmax_budget` IS DELIBERATELY ABSENT, and this is a MEASURED decision rather than an
+        # omission (it was carried as open item 13 for two days on the assumption that it was one).
+        # It reaches only the DERIVED calibration -- never a measurement -- and `_recalibrated`
+        # re-derives that from the profile's own budget-independent measurements whenever
+        # `_calib_inputs` says the live inputs differ, so a cached profile cannot serve a value
+        # derived under another budget.  `scratch_wmax_budget_cover_rig.py` (9/9) checks it, and the
+        # load-bearing check is corpus-wide: of 306 runs whose consumed profile records a
+        # `wmax_ab.budget`, 306 record THAT RUN's own budget -- including the pair that shares one
+        # `probe_key` across two budgets in one session (`log_00162` at 1.0, `log_00163` at 4.0,
+        # `tol_eff` 0.005 vs 0.02).  Keying it would fragment the probe cache (a fresh probe, ~10
+        # model calls) to protect a value that is already correct.  Same trade as `wmax_eg_dir`.
         return h.hexdigest()[:16]
     except Exception:
         return "nologic"
@@ -1467,6 +1468,34 @@ def _cond_key_str(ckey):
 _OSM_AB_MODE = "engine"
 _EV_AB_MODE = "engine"
 
+# THE COND-PATH TOLERANCE LOOSENING, AS A TUNABLE MULTIPLIER (2026-10-04).
+#
+# `_derive_cond_calibrations` loosens the cond profile's `rtol` when `gap.strength < 0.5`.  That
+# threshold never discriminates -- measured over every cond profile that carries the input: `strength`
+# spans 0.0046..0.0861, so `< 0.5` is TRUE on 214 of 214 and `> 2.0` on 0 of 214
+# (`scratch_nonexp_loose_ends_rig.py` Y4a/Y4b).  So the shipped behaviour is a CONSTANT x1.5, and this
+# knob is what lets the operator A/B the loosening's EXISTENCE instead of arguing about its condition:
+#
+#     1.0 = off (no loosening)      1.5 = the historical intent      0.0 = the tightest the blend allows
+#
+# RANGE, DERIVED rather than chosen (`scratch_loosen_knob_range_rig.py`, 5/5 over ~2045 profiles):
+#   * upper 8.0 -- the multiply's own hard bound: above m = 8.0 no profile in the corpus responds,
+#     because the result saturates at the 0.04 cap (`m_sat = 0.04 / base` spans 1.00..8.00).  The BLEND
+#     downstream clamps sooner (4x ceiling reached at m p5 1.4 / median 2.5 / p95 7.0), so most runs
+#     stop moving well before the top.
+#   * lower 0.0 -- and NOT below: the multiply clamps only the TOP, and the blend's clamp is guarded by
+#     `blended > 0`, so a NEGATIVE multiplier would pass through unclamped and reach cfg as a negative
+#     tolerance.  The guard in `_loosen_from_cfg` is therefore a correctness guard, not a taste.
+#   * the A/B's effect size in the value the run CONSUMES (m=1.5 vs 1.0) is a median x1.264, because the
+#     blend mixes the cond value with the model-derived one at `cond_probe_weight` (0.5 by default).
+#
+# IT IS NO LONGER A GLOBAL.  It was, and that was the defect: the two functions that DERIVE a cond
+# calibration do not call `_apply_ab_modes`, so they read a value some earlier entry point left behind --
+# recorded runs show the arithmetic using m = 1.0 while the cfg and the profile's own `calib_flags` said
+# 0.0 and 5.0 (`scratch_cond_loosen_provenance_rig.py`, checks I2a/I2b).  The value now travels as an
+# argument from the cfg that is deriving (`_loosen_from_cfg`), so there is nothing to inherit.
+_COND_RTOL_LOOSEN_MAX = 8.0
+
 
 def _apply_ab_modes(cfg):
     """Set the A/B experiment modes for THIS unit of work.
@@ -1494,6 +1523,14 @@ def _apply_ab_modes(cfg):
     _OSM_AB_MODE = m if m in ("engine", "reanchored", "off") else "engine"
     e = str((cfg or {}).get("_ev_ab_mode", "engine") or "engine")
     _EV_AB_MODE = e if e in ("engine", "ov_only") else "engine"
+    # `cond_rtol_loosen` IS DELIBERATELY *NOT* SET HERE (2026-10-04).  It used to be a global set at this
+    # one point, and a provenance rig then showed the two functions that actually DERIVE a cond
+    # calibration never call this setter -- so they read whatever value a previous entry point had left,
+    # and the recorded runs show the arithmetic using `m = 1.0` where the cfg and the profile's own
+    # `calib_flags` stamp both said 0.0 / 5.0.  The value is now passed explicitly as an argument
+    # (`_loosen_from_cfg`, called from `_derive_cond_calibrations`), which removes the inherited-value
+    # class rather than patching one instance.  Setting it here as well would be a SECOND source of truth
+    # for one number -- the exact shape of the defect it replaces.
 
 # Anchors MEASURED from 9 real non-distilled profiles by
 # scratch_oversmooth_inputs_rig.py: each factor's zero point sits at the
@@ -1659,6 +1696,10 @@ _ORD_BIG = 1e30
 # ---------------------------------------------------------------------------
 _ORDER_GATE_AB = {"off": 0, "on": 0, "pass": 0, "refuse": 0, "unmeasured": 0,
                   "fallback": 0}
+# FLOAT32 EPSILON, READ FROM THE DTYPE THE DIFFERENCES ARE COMPUTED IN rather than written as a
+# literal, so the unresolved-difference floor in `_pixel_order_bound` cannot drift from the arithmetic
+# it describes.  `_pixel_innovations` and the difference stencils below all work in float32.
+_EPS_F32 = float(torch.finfo(torch.float32).eps)
 
 
 def _extrap_geom(us, u_t):
@@ -1764,6 +1805,9 @@ def _derived_series_switch(dtype):
 # model call, and it is the difference between "no effect" and "not connected".
 # ---------------------------------------------------------------------------
 _AB_REACH = {}
+# Node-side hits for the CURRENT run, carried across `_ab_reach_reset` -- the node-side probe runs
+# BEFORE the engine and its counters belong to this run, not to the session.  See the reset's docstring.
+_AB_REACH_CARRY = {}
 
 
 def _ab_hit(name, val=None):
@@ -1795,12 +1839,48 @@ def _ab_hit_max(name, val):
 
 
 def _ab_reach_reset():
+    """Start a fresh per-run record WITHOUT losing the node-side phase.
+
+    WHY THIS CARRIES RATHER THAN CLEARS.  The reset exists so a run's record describes THAT run and not
+    the session's running total (the comment at the call site records the cumulative-counter bug it
+    fixed).  But the NODE-side probe runs BEFORE `aflops_engine` is entered -- that is its whole point,
+    to have the profile ready for the Scheduler -- so its hits are part of THIS run's record and clearing
+    the dict silently deleted them.
+
+    MEASURED CONSEQUENCE, which is why this is a fix and not a tidy-up: `probe.noise_survival_ran` and
+    `probe.noise_survival_skipped` live in `_run_probe`, which the node-side model probe calls; across
+    **668 corpus logs not one carries either key**, because every fresh probe happens node-side and every
+    node-side hit was wiped before the report was written.  The gate that skips ten model calls was
+    therefore invisible -- the same "a switch wired to nothing is indistinguishable from one whose
+    effect is below the floor" trap (rule 9) that this instrumentation exists to prevent.
+    """
+    global _AB_REACH_CARRY
+    try:
+        _AB_REACH_CARRY = {k: [int(v[0]), v[1]] for k, v in _AB_REACH.items()}
+    except Exception:
+        _AB_REACH_CARRY = {}
     _AB_REACH.clear()
 
 
 def _ab_reach_snapshot():
-    """{name: [hits, last_value]} with `hits` first -- cheap, JSON-safe."""
-    return {k: [int(v[0]), v[1]] for k, v in sorted(_AB_REACH.items())}
+    """{name: [hits, last_value]} with `hits` first -- cheap, JSON-safe.
+
+    Includes the node-side carry (see `_ab_reach_reset`), SUMMED with anything the engine hit for the
+    same site, because a hit count is a count of invocations and both phases belong to one run.  The
+    last-value slot keeps the engine's own value when it has one, since that is the later phase.
+    """
+    out = {k: [int(v[0]), v[1]] for k, v in _AB_REACH.items()}
+    try:
+        for k, v in _AB_REACH_CARRY.items():
+            if k in out:
+                out[k][0] += int(v[0])
+                if out[k][1] is None:
+                    out[k][1] = v[1]
+            else:
+                out[k] = [int(v[0]), v[1]]
+    except Exception:
+        pass
+    return {k: out[k] for k in sorted(out)}
 
 
 def _ab_reach_report():
@@ -1813,7 +1893,10 @@ def _ab_reach_report():
 _AFLOPS_LAM_MIN = -3.0
 _AFLOPS_LAM_MAX = 0.0
 _AFLOPS_X0M_ENV = 1.3
-_ORD_EMA = 0.5        # innovation-stack EMA weight (half-life: one step)
+# `_ORD_EMA` WAS REMOVED 2026-10-04 (rule 26 -- a vestigial identifier is worse than none).  The EMA
+# weight is a per-run value read from cfg (`ord_ema`, `ENGINE_DEFAULTS`), so a module constant holding a
+# second copy of it would read as the live default to anyone who grepped for it.  Its three use sites now
+# read `_ord_ema`; the value the maths used is stamped as `order.ema_in_force`.
 _ORD_Z = 3.5          # robust outlier threshold (modified z-score)
 _ORD_R_FLOOR = 1.5    # novelty must ALSO beat the pixel's own envelope
 _ORD_ENV_DECAY = 0.7  # motion-envelope decay (was the order_jema_decay knob)
@@ -1895,6 +1978,80 @@ def _pixel_order_bound(pts, u_mid, du, allowed, tol_eff, kmax_cap=8):
         kmax = int(max(2, min(int(kmax_cap), n - 1, len(allowed) + 1)))
         order = torch.ones_like(ref)
         per_k = []
+        # ---- THE REMAINDER SCALE IS EVALUATED AT THE FAR END.  THIS IS THE ONLY PATH. ----------
+        # `scratch_rtol_bound_rig.py` measured the previous form against EXACTLY constructed
+        # interpolants and found it was not an upper bound: it held on 7 of 12 analytic (case, k)
+        # pairs, and when the k-th difference VANISHED it read ~1e-15 against a true error of 1.168 --
+        # so the order was admitted with certainty and no `tol` could refuse it, because 0 <= tol for
+        # every positive tol.
+        #
+        # WHY.  The Lagrange remainder needs f^(k)(xi) for some xi in [u_last_node, u_mid], and for
+        # EXTRAPOLATION that interval reaches BEYOND the newest node.  Estimating f^(k) AT the newest
+        # node was therefore systematically low when f^(k) grows across the reach: measured at
+        # 0.706 / 0.441 / 0.153 of the far-end remainder for c = 0.5 / 1.0 / 2.0.
+        #
+        # THE CHANGE: a first-order extrapolation of f^(k) from the newest node out to the point being
+        # extrapolated to, using the NEXT difference --
+        #     scale_eff = scale_k + |u_mid - u_newest| * scale_{k+1}
+        # Both terms are non-negative (the engine takes abs), so this can only RAISE the bound: it can
+        # never admit an order the old form refused, only refuse more.  It also closes the vanishing
+        # case for free, because when `scale_k` is 0 the second term still carries the next difference.
+        #
+        # RIGGED at 7/12 -> 11/12 pairs, vanishing case 1.102e-15 -> 5.419e+00.  THE RESIDUAL IS KNOWN
+        # AND NOT HIDDEN: one pair (exp c=2.0, k=2) is still 25% short, because a first-order
+        # correction fixes the trend and not the curvature.
+        #
+        # IT WAS A/B'd AND THE SWITCH WAS REMOVED (2026-10-04).  Operator: *"with removal we both mean
+        # also implement the new code, right?  Old code goes too."*  The A/B measured that this
+        # correction is INERT on the configurations tried -- it changed the criterion's own admission
+        # on up to a third of steps (one case to zero) and the latent was BIT-IDENTICAL -- which is a
+        # statement about the criterion not being the binding constraint, NOT about this change being
+        # wrong.  See NOTES "THE SWITCH IS LIVE AND THE OUTCOME IS BIT-IDENTICAL" and "RIG 2".
+        #
+        # `no_history` is the one case the correction cannot reach: at k == kmax the (k+1)-th
+        # difference needs one more node than the history holds.  It is recorded per order rather
+        # than silently skipped.
+        #
+        # NOT A CACHED PATH (AGENTS rule 28): this function has exactly ONE call site, in the sampling
+        # loop, and nothing probe-derived reads its result.
+        def _scale_of(kk):
+            """`(dk / rho**kk, dk, h)`: the estimate of f^(kk) at the NEWEST node.
+
+            The RAW `dk` and the spacing travel with it because the top order needs them: at
+            `k == kmax` the correction's input does not exist, and whether the near-end scale may be
+            trusted at all depends on whether `dk` is resolved above the difference's own rounding
+            floor.  Returning them costs nothing -- they are already computed here.
+            """
+            _sel = pts[-(kk + 1):]
+            if len(_sel) < kk + 1:
+                return None
+            _sus = [float(p[0]) for p in _sel]
+            _h = sum(abs(_sus[i + 1] - _sus[i]) for i in range(kk)) / float(kk)
+            if not (_h > 0.0):
+                return None
+            _acc = None
+            for j in range(kk + 1):
+                _t = _sel[kk - j][1].float() * float(((-1) ** j) * math.comb(kk, j))
+                _acc = _t if _acc is None else _acc + _t
+            _dk = _acc.pow(2).mean(dim=1, keepdim=True).sqrt() / (_h ** kk) / ref
+            # DE-BIAS as in _measure_dk_scale: for x0 = e^{cu} a raw k-th difference over h is
+            # low by rho(ch)^k.  Without it the bound is conservative by that factor.
+            _ch = r1 * _h
+            _rho = torch.where(_ch > 1e-9,
+                               (1.0 - torch.exp(-_ch)) / _ch.clamp_min(1e-9),
+                               torch.ones_like(_ch))
+            return _dk / _rho.pow(kk), _dk, _h
+
+        # COMPUTED ONCE for k = 2 .. kmax+1.  The +1 is the correction's own input, so precomputing
+        # avoids computing each order's difference twice (the loop would otherwise recompute k+1's
+        # when it reaches k+1).  One extra order of cheap integer-weighted sums, no extra model call.
+        _scale_by_k = {}
+        for _kk in range(2, kmax + 2):
+            _s = _scale_of(_kk)
+            if _s is not None:
+                _scale_by_k[_kk] = _s
+
+        corrected_n = 0
         for k in range(2, kmax + 1):
             if (k - 1) < len(allowed) and not allowed[k - 1]:
                 per_k.append([k, None, None, "refused for this step"])
@@ -1905,28 +2062,62 @@ def _pixel_order_bound(pts, u_mid, du, allowed, tol_eff, kmax_cap=8):
             if not (h > 0.0):
                 per_k.append([k, None, None, "degenerate spacing"])
                 continue
-            acc = None
-            for j in range(k + 1):
-                term = sel[k - j][1].float() * float(((-1) ** j) * math.comb(k, j))
-                acc = term if acc is None else acc + term
-            dk = acc.pow(2).mean(dim=1, keepdim=True).sqrt() / (h ** k) / ref
-            # DE-BIAS as in _measure_dk_scale: for x0 = e^{cu} a raw k-th difference over h is
-            # low by rho(ch)^k.  Without it the bound is conservative by that factor.
-            ch = r1 * h
-            rho = torch.where(ch > 1e-9,
-                              (1.0 - torch.exp(-ch)) / ch.clamp_min(1e-9),
-                              torch.ones_like(ch))
-            scale = dk / rho.pow(k)
+            scale = _scale_by_k.get(k)
+            if scale is None:
+                per_k.append([k, None, None, "unmeasurable difference"])
+                continue
+            scale, _dk_raw, _h_k = scale
+            resolved = None
+            scale_next = _scale_by_k.get(k + 1)
+            if scale_next is not None:
+                scale = scale + abs(float(u_mid) - sus[-1]) * scale_next[0]
+                corr = "applied"
+                corrected_n += 1
+            else:
+                # NOT ENOUGH HISTORY for the (k+1)-th difference -- this is `k == kmax` at the
+                # boundary.  The correction cannot reach the top order, so it is judged on the
+                # near-end scale alone and the step SAYS SO (`no_history`) rather than pretending
+                # otherwise.
+                #
+                # AND ONE CASE IS REFUSED RATHER THAN JUDGED, because the near-end scale is not merely
+                # imprecise there but carries NO information: a k-th difference that has cancelled to
+                # the arithmetic noise floor says nothing about f^(k), so the bound reads ~0 while the
+                # true error can be O(1).  Measured IN THE ENGINE by `scratch_order_kmax_hole_rig.py`:
+                # in that case the bound is 0 and the true relative error 1.168 -- 73.8x outside the
+                # tolerance the order was admitted against, at order 4 of a 5-node history.
+                #
+                # THE FLOOR IS DERIVED, NOT CHOSEN.  `_dk` is a float32 sum of k+1 terms whose
+                # coefficients sum to 2^k in absolute value, so its rounding error is bounded by
+                # (k+1) * eps * 2^k * ref -- i.e. (k+1) * eps * 2^k / h^k after the same /h^k/ref
+                # normalisation `_dk` itself uses.  Anything at or below that is indistinguishable
+                # from zero at this precision.
+                #
+                # A RESOLVED difference keeps the previous behaviour exactly (judged on the near-end
+                # scale), so a run whose top difference is healthy is BIT-IDENTICAL to before this
+                # change -- the refusal fires only where the old path was demonstrably unsound.
+                corr = "no_history"
+                resolved = _dk_raw > (((k + 1) * _EPS_F32 * (2.0 ** k)) / (_h_k ** k))
             geom = 1.0
             for p in pts[-k:]:
                 geom *= abs(float(u_mid) - float(p[0]))
             geom /= float(math.factorial(k))
             bound = geom * scale
-            ok = bound <= tol_x0
+            ok = (bound <= tol_x0)
+            if resolved is not None:
+                ok = ok & resolved
             order = torch.where(ok, torch.full_like(order, float(k)), order)
             per_k.append([k, round(float(bound.mean()), 8),
-                          round(float(ok.float().mean()), 4), None])
-        return order, {"kmax": kmax, "n": n, "tol_x0": round(tol_x0, 8), "per_k": per_k}
+                          round(float(ok.float().mean()), 4), corr])
+        # RULE 9: the correction must PROVE it runs.  `corrected_n` counts the orders this step
+        # actually corrected (as opposed to `no_history`), and the per-order `corr` marker beside it
+        # says which -- so "the correction did nothing here" can be told from "it never applied".
+        try:
+            _ab_hit("order_bound.corrected", float(corrected_n))
+            _ab_meta = {"orders_corrected": corrected_n, "kmax": kmax}
+        except Exception:
+            _ab_meta = None
+        return order, {"kmax": kmax, "n": n, "tol_x0": round(tol_x0, 8), "per_k": per_k,
+                       "bound_fix": _ab_meta}
     except Exception as e:
         return None, {"reason": "exception: {}".format(e)}
 
@@ -3666,8 +3857,13 @@ def _aflops_step(x, x0, hist, s, sn, order=2, lam_min=None, lam_max=None,
 # contract of ComfyUI's cache machinery itself (see e.g.
 # QwenImage21Transformer2DModel.select_prefix_cache), cache entries that are
 # not dicts are dropped outright, and the real sampling loop is untouched.
+# The rewrite itself is inline in `_apply_probe_profile`-time cache isolation
+# (see the `v2["device"] = "off"` block below): it inspects and rewrites the
+# cache dicts it finds, so there is no single dict to name here.  A module
+# constant `_CACHE_OPT_OUT` used to sit here holding that literal and NOTHING
+# read it -- removed 2026-10-04 by the dead-code sweep, which is why the
+# contract is described here and implemented at the use site.
 # ---------------------------------------------------------------------------
-_CACHE_OPT_OUT = {"device": "off"}
 _CACHE_ISOLATION_LOGGED = [False]
 _FROZEN_PROBE_LOGGED = False   # one-shot: the frozen-probe warning floods otherwise
 _PROBE_CALL_DIAG = {}          # which model call path the last probe step took
@@ -4391,9 +4587,19 @@ def _calib_inputs(cfg):
         budget = round(float(cfg.get("wmax_budget", 1.0) or 1.0), 6)
     except (TypeError, ValueError):
         budget = 1.0
+    # THE LOOSENING MULTIPLIER BELONGS HERE TOO.  It changes the DERIVED `calib["rtol"]`, so a cached
+    # profile must be re-derived when it changes -- the same rule-28 discipline as the budget above, and
+    # the reason a knob nudge costs no re-probe.  Without it the operator's A/B would compare two runs
+    # that both consumed the calibration the FIRST of them was built with, which is the "switch reads ON
+    # while running OFF" defect this function exists to prevent.
+    try:
+        loosen = round(float(cfg.get("cond_rtol_loosen", 1.5) or 0.0), 6)
+    except (TypeError, ValueError):
+        loosen = 1.5
     return {"pct_derived": bool(cfg.get("pct_derived", False)),
             "wmax_bound": bool(cfg.get("wmax_bound", False)),
-            "wmax_budget": budget}
+            "wmax_budget": budget,
+            "cond_rtol_loosen": max(0.0, min(_COND_RTOL_LOOSEN_MAX, loosen))}
 
 
 def _derive_calibrations(profile):
@@ -5121,7 +5327,15 @@ def _recalibrated(profile, cfg, derive):
         return profile
     profile[_CALIB_FLAGS_KEY] = want
     try:
-        profile["calib"] = derive(profile)
+        # THE CONFIG THAT TRIGGERED THIS RE-DERIVATION IS THE ONE THE DERIVATION MUST READ.
+        # `_derive_cond_calibrations` takes an optional cfg precisely so the value it uses comes from the
+        # same cfg whose inputs justified re-deriving -- see its docstring for the divergence this closes.
+        # The model-path derivation takes only the profile, so the two-argument call is attempted and the
+        # one-argument form is the fallback rather than the reverse.
+        try:
+            profile["calib"] = derive(profile, cfg)
+        except TypeError:
+            profile["calib"] = derive(profile)
     except Exception:
         pass
     return profile
@@ -5632,6 +5846,14 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
             cached = _COND_PROBE_PROFILES.get(_key)
             if cached is not None:
                 _PROFILE_BY_MODEL[mk] = cached
+                # WHICH NODE-SIDE PROBE RAN gets its OWN phase key, and NOT `node_probe_state`.
+                # The two probes both run in one queue -- the model probe per (model, config) and
+                # this one per prompt -- so sharing one scalar means whichever runs second erases
+                # the other's outcome.  The cost of that was visible in the corpus: a queue whose
+                # only node-side work was THIS probe reported `probe_calls_node_side` > 0 with no
+                # state beside it at all (10 runs), because `node_probe_state` belongs to the model
+                # probe.  The vocabulary deliberately mirrors it: cache_hit / empty_deferred / ran.
+                _nphase_set("node_cond_probe_state", "cache_hit")
                 logging.info("[A-FloPS-cond-probe] node-side probe: model+prompt "
                              "unchanged, using cached profile (skip re-probe)")
                 return cached, True
@@ -5693,6 +5915,7 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
             logging.info("[A-FloPS-cond-probe] node-side chain probe did "
                          "not execute; deferring to the engine-side probe "
                          "at sampling time")
+            _nphase_set("node_cond_probe_state", "empty_deferred")
             return None, False
 
         if profile is not None and cond_sig is not None:
@@ -5704,6 +5927,7 @@ def _run_node_side_cond_probe(model_patcher, positive, negative, cfg,
                 # schedule-keyed slot keeps freshness per schedule.
                 _COND_PROBE_PROFILES[_plain] = profile
             _PROFILE_BY_MODEL[mk] = profile
+        _nphase_set("node_cond_probe_state", "ran")
         return profile, False
     except Exception as e:
         logging.warning("[A-FloPS-cond-probe] node-side probe failed "
@@ -5756,6 +5980,14 @@ def _node_probe_param_sig(cfg):
     380 runs at the shipped default consumed a non-zero `oversmooth`, two of them
     in mode "off", because a node-side profile built under an arm was adopted by
     later default-mode runs.
+
+    `wmax_budget` IS *NOT* HERE, by the same measured reasoning that keeps it out of
+    `_schedule_sig`: the switch above changes what the profile MEASURES, whereas the
+    budget reaches only the DERIVED calibration, and `_recalibrated` re-derives that
+    from the profile's own budget-independent measurements before any consumer reads it.
+    Adding it would fragment this cache (a fresh probe, ~10 model calls) for nothing.
+    `scratch_wmax_budget_cover_rig.py` (9/9) carries the evidence, including the
+    306-of-306 corpus check.
     """
     return "|".join([
         str(int(cfg.get("probe_steps", 10))),
@@ -6339,7 +6571,30 @@ def _gap_outputs(x0_cfg, x0_cond, x0_uncond):
         pass
     return out
 
-def _derive_cond_calibrations(profile):
+def _loosen_from_cfg(cfg):
+    """The loosening multiplier FOR A GIVEN CFG, clamped to the derived range `[0, 8]`.
+
+    WHY THIS EXISTS, AND WHY IT IS NOT THE MODULE GLOBAL ANY MORE (2026-10-04).
+    This value used to be read from `_COND_RTOL_LOOSEN`, a module global set by `_apply_ab_modes`.  A
+    provenance rig (`scratch_cond_loosen_provenance_rig.py`) then found the two functions that actually
+    DERIVE a cond calibration -- `_run_cond_probe` and `_run_focused_cond_probe` -- never call that
+    setter, while three OTHER entry points do.  Solving for the multiplier the recorded values imply
+    showed `m = 1.0` where the run's cfg and the profile's own `calib_flags` stamp both said 0.0 and 5.0:
+    **the stamp recorded one number and the arithmetic used another**, which is the defect class this
+    project treats as unacceptable (a switch that reports a value while the code runs something else).
+    Reading the cfg that is right there removes the class instead of patching one instance: there is no
+    stale value to inherit because nothing is inherited.
+    """
+    try:
+        v = float((cfg or {}).get("cond_rtol_loosen", ENGINE_DEFAULTS.get("cond_rtol_loosen", 1.5)))
+    except (TypeError, ValueError):
+        v = 1.5
+    # The lower guard is CORRECTNESS, not taste: the multiply below clamps only its top, and the
+    # downstream blend's clamp is skipped when the blend is not positive, so a negative multiplier would
+    # reach cfg as a negative tolerance.
+    return max(0.0, min(_COND_RTOL_LOOSEN_MAX, v))
+
+def _derive_cond_calibrations(profile, cfg=None):
     calib = {}
     med_curv = profile.get("med_curv", 0.0)
     med_err_raw = float(profile.get("med_local_err", 0.0) or 0.0)
@@ -6362,12 +6617,44 @@ def _derive_cond_calibrations(profile):
     # order) made the logged `rtol` and the tol the cap consumed differ by the 1.5x factor:
     # anima log_00159 records `rtol` 0.0075 with `wmax_ab.tol` 0.005.
     gap = profile.get("gap")
-    if gap is not None:
-        strength = float(gap.get("strength", 1.0))
-        if strength < 0.5 and "rtol" in calib:
-            calib["rtol"] = round(min(0.04, calib["rtol"] * 1.5), 4)
-        elif strength > 2.0 and "guard_floor" in calib:
-            calib["guard_floor"] = round(max(0.05, calib["guard_floor"] * 0.7), 4)
+    # THE GATE IS COUNTED SEPARATELY FROM THE ARMS, and that is a fix rather than decoration: the first
+    # version counted only INSIDE `if strength < 0.5 and "rtol" in calib:`, so a run where the loosening
+    # did not apply left the log COMPLETELY SILENT about why -- indistinguishable from a run where the
+    # whole code path was never reached.  The operator's first A/B (12 runs, knob swept 0.0 .. 8.0) showed
+    # exactly that: identical tolerances across every arm and an empty `ab_reach`, with nothing in the
+    # record to say whether the profile had no `gap`, no derivable `rtol`, or was never re-derived.
+    if gap is None:
+        _ab_hit("cond.loosen.no_gap")
+    else:
+        _ab_hit("cond.loosen.entered")
+        # ---------------------------------------------------------------------------------------
+        # PATH A, APPLIED 2026-10-04 -- THE THRESHOLDS ARE GONE (register row 23, closed by the
+        # operator: "we can close it and put it on record").  What used to be here:
+        #
+        #     if strength < 0.5 and "rtol" in calib:      rtol *= m      # TRUE on 214 of 214
+        #     elif strength > 2.0 and "guard_floor" ...   gf  *= 0.7      # TRUE on 0 of 214
+        #
+        # `strength` is `||x0_cond - x0_uncond|| / ||x0_uncond||` and spans 0.0046..0.0861 over every
+        # cond profile that carries one, so the first test never chose anything -- a CONSTANT wearing a
+        # condition -- and the second was UNREACHABLE, with its target `guard_floor` not even a tunable
+        # key (it is absent from `ENGINE_DEFAULTS`, so `_blend_set("guard_floor")` returns early on every
+        # run: the arm could not have reached cfg even if it had fired).  The loosening is now gated on
+        # the MEASUREMENT existing, which is what the branch was always for, and its SIZE is the knob.
+        #
+        # BEHAVIOUR-IDENTICAL, MEASURED rather than argued: `scratch_gap_strength_fix_rig.py` F3 shows
+        # the change moves `rtol` on 0 of 891 cond profiles, and F2b shows the deleted arm was true on 0
+        # of 214.  Nothing to A/B.
+        # ---------------------------------------------------------------------------------------
+        if "rtol" not in calib:
+            _ab_hit("cond.loosen.no_rtol")
+        _m = _loosen_from_cfg(cfg)
+        if "rtol" in calib:
+            _ab_hit("cond.rtol_loosen.x1.5_arm")
+            if _m != 1.0:
+                calib["rtol"] = round(min(0.04, calib["rtol"] * _m), 4)
+                _ab_hit("cond.rtol_loosen.applied", round(_m, 4))
+            else:
+                _ab_hit("cond.rtol_loosen.off")
     if med_curv > 0:
         lc = math.log(max(med_curv, 1e-8) + 1.0)
         if lc < math.log(1.5):
@@ -6765,7 +7052,9 @@ def _run_focused_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
                                for s_lo, s_hi, f in (fragile_ranges or [])],
         }
         profile["trajectory_state"] = _compute_trajectory_state(profile)
-        profile["calib"] = _derive_cond_calibrations(profile)
+        # THE CFG GOES IN, so the loosening multiplier used here is the one THIS run's cfg names -- see
+        # `_loosen_from_cfg` for the stamp-vs-arithmetic divergence this closes.
+        profile["calib"] = _derive_cond_calibrations(profile, cfg)
         return profile
     except Exception as e:
         logging.warning("[A-FloPS-focused] probe failed: %s", e)
@@ -7172,7 +7461,9 @@ def _run_cond_probe(model, x, sigmas, extra_args, cfg, gap_ctx=None,
             "whitepoint": _whitepoint_from_x0s(x0s),
         }
         profile["trajectory_state"] = _compute_trajectory_state(profile)
-        profile["calib"] = _derive_cond_calibrations(profile)
+        # THE CFG GOES IN: the loosening multiplier must be the one THIS run's cfg names, not a value an
+        # earlier entry point left in a module global (see `_loosen_from_cfg`).
+        profile["calib"] = _derive_cond_calibrations(profile, cfg)
         return profile
     except Exception as e:
         logging.warning("[A-FloPS-cond-probe] probe failed: %s", e)
@@ -7195,10 +7486,15 @@ def _apply_cond_probe_profile(cfg, cond_profile, tune, weight, auto_tunable):
         return
 
     def _blend_set(key):
+        # EVERY EARLY EXIT IS COUNTED, for the same reason the loosening's gate is: this function has
+        # three silent returns, and any of them makes the cond path's contribution to `key` invisible in
+        # the log.  That is what left the operator's first A/B with a null it could not explain.
         if key not in auto_tunable:
+            _ab_hit("cond.blend.not_tunable." + str(key))
             return
         cond_val = cond_calib.get(key)
         if cond_val is None:
+            _ab_hit("cond.blend.no_value." + str(key))
             return
         try:
             cur = float(cfg.get(key))
@@ -7207,7 +7503,9 @@ def _apply_cond_probe_profile(cfg, cond_profile, tune, weight, auto_tunable):
             if cur > 0 and blended > 0 and key != "warmup":
                 blended = max(0.25 * cur, min(4.0 * cur, blended))
             cfg[key] = blended
+            _ab_hit("cond.blend.applied." + str(key))
         except (TypeError, ValueError):
+            _ab_hit("cond.blend.unparseable." + str(key))
             pass
 
     if tune.get("guard", True):
@@ -7314,10 +7612,10 @@ def _warp_frontier(profile, base_sigmas, bias=1.0, p=2.0, coarse=0.01):
 
         _n_steps = len(_base) - 1
         # difficulty diagnostic: reference = the user's OWN schedule
-        ref, _ = _proxy(_base)
+        ref, below_base = _proxy(_base)
         best = 1.0
-        info = {"worst_ratio": 1.0, "below": 0, "floor": round(floor, 6),
-                "why": "nothing below 1.00 is safe"}
+        info = {"worst_ratio": 1.0, "below": below_base, "below_base": below_base,
+                "floor": round(floor, 6), "why": "nothing below 1.00 is safe"}
         w = 1.0
         while w > 0.0:
             w = round(w - coarse, 4)
@@ -7331,11 +7629,25 @@ def _warp_frontier(profile, base_sigmas, bias=1.0, p=2.0, coarse=0.01):
             sig = [float(v) for v in g.tolist()]
             worst, below = _proxy(sig)
             ratio = (worst / ref) if ref > 0.0 else 1.0
-            if below > 0:
-                info["why"] = "coverage: steps below the measured floor"
+            # COVERAGE IS MEASURED AGAINST THE USER'S OWN SCHEDULE, NOT AGAINST ZERO.
+            # WHY THIS CHANGED (2026-10-04).  The test used to be `below > 0`, i.e. the warp had to
+            # leave EVERY step inside the probe's measured band -- but the band's floor is the probe
+            # grid's LOWEST sigma while a real 50-step schedule runs on down to `sigma_min`, so the
+            # user's own base already sits below it.  The search walks w DOWN from 1.0 and breaks at
+            # the first refusal, so it broke on its first candidate, `best` stayed 1.0, and the
+            # frontier reported `safe_range [1.0, 1.0]` on EVERY run it ever evaluated.
+            # MEASURED on the corpus: auto_warp was ON in 439 runs and `warp_used` was 1.0 in all
+            # 439, with `why` = "coverage: steps below the measured floor" -- an inert switch that
+            # looked like a considered decision, which is DEAD_FEATURES §8 read as "unproven at n=1"
+            # long after n had grown past 400.  The warp cannot be asked to repair a coverage
+            # violation it did not cause; what it must not do is ADD one.
+            if below > below_base:
+                info["why"] = "coverage: the warp adds steps below the measured floor"
+                info["below"] = below
+                info["below_base"] = below_base
                 break
             best = w
-            info = {"worst_ratio": round(ratio, 4), "below": below,
+            info = {"worst_ratio": round(ratio, 4), "below": below, "below_base": below_base,
                     "floor": round(floor, 6), "why": "coverage-limited"}
         info["safe_range"] = [best, 1.0]
         return float(best), info
@@ -7817,6 +8129,20 @@ ENGINE_DEFAULTS = {
     # the corrector also consumes.  1.0 is neutral and bit-identical to no multiplier;
     # >1 admits higher orders at the same measured error, <1 is more conservative.
     "wmax_budget": 1.0,
+    # THE COND-PATH LOOSENING MULTIPLIER (widget on the Debug Options node).  1.5 = shipped behaviour,
+    # bit-identical to the literal it replaced; 1.0 = the loosening OFF (nothing is multiplied).  The
+    # shipped CONDITION (`gap.strength < 0.5`) is kept unchanged around it, and that condition never
+    # discriminates (see `_COND_RTOL_LOOSEN` above), so in practice this knob is the whole question: does
+    # loosening the cond-path tolerance help or not.  Range and its derivation: `_COND_RTOL_LOOSEN`.
+    "cond_rtol_loosen": 1.5,
+    # THE ORDER SYSTEM'S EMA WEIGHT (widget on the Debug Options node).  Shipped **0.37** since
+    # 2026-10-04, which IS the measured AR(1) optimum (CONSTANTS_AUDIT section 15: the logged `ord_innov`
+    # series, n=682, has lag-1 autocorrelation 0.630, and for an exponential smoother `alpha* = 1 - rho_1`
+    # = 0.370).  It was 0.5 -- 0.13 stiffer than the measurement wants -- until the A/B that section asked
+    # for: the operator's controlled triple, a bit-identical replicate pair, a 3.33e-1 latent difference on
+    # the arm, and his eye preferring 0.37.  Range 0..1 is DEFINITIONAL: it is a convex blend weight
+    # between the previous EMA and the new sample.
+    "ord_ema": 0.37,
     # FORCED PER-PIXEL ORDER FLOOR (widget on the Sampler node).  1.0 = shipped behaviour and
     # bit-identical: the branch below is not entered at all.  Above 1 it RAISES the order the
     # ladder would otherwise use -- as a DEMAND, never an override: everything downstream
@@ -7919,6 +8245,23 @@ ENGINE_DEFAULTS = {
     "guard_quantile": 0.99,
     "guard_mad_floor": 0.1,
     "guard_phase_relax": 1.0,
+    # THE ANOMALY DETECTOR'S ON/OFF.  `an_enable` is now a SAMPLER WIDGET (2026-10-03), which is
+    # why it is the one key in this group that a user can reach: the others (`an_from`, `an_win`,
+    # the four thresholds) are DERIVED per run from the probe at `aflops.py:4533` and `:5169`,
+    # so exposing them as widgets would let a fixed number silently override a measurement.
+    #
+    # WHY IT BECAME A WIDGET, and it is the operator's own ruling: a switch they must TEST cannot
+    # live in `ENGINE_DEFAULTS`, because a default lives in the source and every arm of an A/B
+    # then costs a ComfyUI restart.  The prompt for it was a labelled artifact: see
+    # `## THE LABELLED OFFENDER`, where the detector fired at step 9 of ONE run out of five,
+    # `lf_damp` was set to 0.9 on the resulting mask, and that mask -- dilated by 2 -- damps
+    # those pixels' local-field correction for SEVEN steps.  Turning it off is the one-run
+    # experiment that separates "the detector is the cause" from "the prompt is".
+    #
+    # WHEN IT IS OFF the mask simply never fires: `amask` stays None, `lf_damp` stays None, and
+    # the guard's separate `new_damp` path (which needs `guard_trip`) is the only remaining
+    # source of damping.  The `lf.damp` report field then reads 0 for the whole run, which is
+    # what makes the A/B legible in the corpus.
     "an_enable": True, "an_from": 0.15, "an_win": 9,
     "an_spatial": 5.0, "an_novelty": 4.0, "an_value": 2.5,
     "an_phase_relax": 0.5,
@@ -8631,6 +8974,25 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
     _DERIVED_RTOL = 1.536e-2
     err_mode = cfg["err_mode"]
     grad_strength = float(cfg.get("grad_strength", 5.0))
+    # THE ORDER-SYSTEM'S EMA WEIGHT, READ ONCE PER RUN FROM THIS RUN'S OWN CFG (2026-10-04).
+    # It was the module constant `_ORD_EMA = 0.5`, which is why the operator could not reach it.  It is
+    # read HERE, in the same function that consumes it, rather than from a module global set by some
+    # other entry point -- that indirection is what let the cond-path loosening report one value and use
+    # another for four rounds (`scratch_cond_loosen_provenance_rig.py`).
+    # The range is DEFINITIONAL, not chosen: it is a convex blend weight between the previous EMA and the
+    # new sample, so 0.0 = ignore history and 1.0 = ignore the new sample.  THE SHIPPED VALUE IS 0.37, the
+    # measured AR(1) optimum (`CONSTANTS_AUDIT` section 15: the corpus's own logged `ord_innov` series,
+    # n=682, has lag-1 autocorrelation 0.630, and `alpha* = 1 - rho_1 = 0.370`).  It was 0.5 -- 0.13 above
+    # the optimum -- until 2026-10-04, when § 15's "a value change would need its own A/B" was satisfied:
+    # the operator's controlled triple (0.5 / 0.37 / 0.5, one session, one prompt, one seed; the 144-key
+    # resolved cfg differs in exactly ONE key) has a BIT-IDENTICAL replicate pair and a 3.33e-1 latent /
+    # 99.1 %-of-pixels difference on the arm, and he judged 0.37 better.  Closed form and eye agree.
+    try:
+        _ord_ema = float(cfg.get("ord_ema", ENGINE_DEFAULTS.get("ord_ema", 0.37)))
+    except (TypeError, ValueError):
+        _ord_ema = 0.37
+    _ord_ema = max(0.0, min(1.0, _ord_ema))
+    _ab_hit("order.ema_in_force", round(_ord_ema, 4))
     noise_space = cfg["noise_space"]
     s_noise = float(cfg["s_noise"])
     guard = (_OutlierGuard(window=cfg["guard_window"], z=cfg["guard_sensitivity"],
@@ -9320,6 +9682,13 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                     amask = amask | sust
             if bool(amask.any()):
                 an_detected = True
+                # REACHABILITY, because `an_enable` is an A/B switch and a toggle wired to nothing
+                # is indistinguishable from one whose effect is below the noise floor (rule 9).
+                # The per-step `an_detected` field already says WHICH step fired; this counter says
+                # whether the arm fired AT ALL, which is the thing an off/on comparison needs.
+                # Without it, "an_enable=False changed nothing" cannot be told apart from
+                # "an_enable=False never reached the engine".
+                _ab_hit("an.detected")
         if jmap is not None:
             jhist.append(jmap)
             if len(jhist) > 3:
@@ -9698,12 +10067,43 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             # when the branch does, but the rho term is a SECOND, optional operand
             # (`lf_rho_prev is not None`), so it needs its own counter -- otherwise
             # `_LF_ACT_RHO` could read "insensitive" because it was never read.
-            _cm = (lf_m_prev.abs() > (_LF_ACT_M * lf_amp_prev)).unsqueeze(1)
+            _cm_amp = (lf_m_prev.abs() > (_LF_ACT_M * lf_amp_prev)).unsqueeze(1)
+            _cm = _cm_amp
             _ab_hit("lf.contam_amp")
+            _cm_rho = None
             if lf_rho_prev is not None:
-                _cm = _cm | (lf_rho_prev > _LF_ACT_RHO)
+                _cm_rho = (lf_rho_prev > _LF_ACT_RHO)
+                _cm = _cm | _cm_rho
                 _ab_hit("lf.contam_rho")
             lf_contam = _cm.to(torch.bool)
+            # THE PER-PIXEL COVERAGE, WHICH THE CONSTANT AUDIT COULD NOT GET FROM THE LOGS.
+            # `CONSTANTS_AUDIT` §11 left two rows unresolved for exactly one reason: the step record
+            # carried `m_abs` (a MEAN) and `m_min`/`m_max` (extremes), and a mean cannot say where a
+            # per-PIXEL threshold sits in the distribution it thresholds.  `_LF_ACT_M`'s placement was
+            # therefore "correct in kind, exact placement needs per-pixel data", and `_LF_ACT_RHO`'s
+            # inertness could only be inferred from `rho_max` (a per-step MAXIMUM, which is an upper
+            # bound on the operand's reach rather than its effect).
+            #
+            # WHAT IS STAMPED, and why these and not quantiles: the mask IS a CDF test, so the honest
+            # per-pixel record is the CDF itself at a few points -- `|m| / amp` against the shipped
+            # threshold and against round numbers on either side.  Cheap (a compare + a mean per point,
+            # no sort, no extra kernel class) and it places the constant exactly.  `rho_only` is the
+            # operand's OWN contribution: pixels the rho term adds that the amplitude term did not
+            # already flag, which is the number that says whether `_LF_ACT_RHO` does anything.
+            try:
+                _mr = lf_m_prev.abs() / lf_amp_prev.abs().clamp_min(1e-12)
+                lf_diag["contam"] = {
+                    "amp": round(float(_cm_amp.float().mean()), 4),
+                    "rho": (round(float(_cm_rho.float().mean()), 4)
+                            if _cm_rho is not None else None),
+                    "rho_only": (round(float((_cm_rho & ~_cm_amp).float().mean()), 5)
+                                 if _cm_rho is not None else None),
+                    "cdf": [round(float((_mr > _t).float().mean()), 4)
+                            for _t in (0.1, float(_LF_ACT_M), 0.5, 1.0)],
+                    "cdf_at": [0.1, float(_LF_ACT_M), 0.5, 1.0],
+                }
+            except Exception:
+                pass
         lf_applied_prev = False
         if (bool(cfg.get("order_pixel_adaptive", True))
                 and eff_cap >= 2 and s2 > 1e-8 and len(hist) >= 1):
@@ -9755,8 +10155,9 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             reset_m = None
             j = jmap.float().unsqueeze(1) if jmap is not None else None
             # REACHABILITY FOR THE ORDER SYSTEM'S OWN CONSTANTS.  `_ORD_Z` and `_ORD_R_FLOOR`
-            # are read ONLY inside the `j is not None` + `ladder_auto` branch below, and `_ORD_EMA`
-            # only in the innovation-EMA update: a sensitivity rig that sweeps them without
+            # are read ONLY inside the `j is not None` + `ladder_auto` branch below, and the EMA weight
+            # (`_ord_ema`, a per-run value from cfg since 2026-10-04 -- NOT the old `_ORD_EMA` constant,
+            # which is gone) only in the innovation-EMA update: a sensitivity rig that sweeps them without
             # proving this branch ran is varying code that may never execute (the exact
             # vacuity that made the first Batch-0 sweep meaningless).  Counted, so a rig can
             # assert non-vacuity instead of assuming it.
@@ -9812,7 +10213,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                         Iema = Iema[:P]
                     Iema = torch.where(
                         meas & (Iema < _ORD_BIG),
-                        _ORD_EMA * Iema + (1.0 - _ORD_EMA) * Im,
+                        _ord_ema * Iema + (1.0 - _ord_ema) * Im,
                         torch.where(meas, Im, Iema))
                     _ab_hit("order.ema_update")
                     _bias = (1e-4 * idxT)
@@ -9994,8 +10395,8 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
                 _yv = torch.where((I1m < _ORD_BIG) & (I_ap < _ORD_BIG),
                                   _yv, torch.zeros_like(_yv))
                 lf_suppress = (_yv if lf_suppress is None
-                               else _ORD_EMA * lf_suppress
-                               + (1.0 - _ORD_EMA) * _yv)
+                               else _ord_ema * lf_suppress
+                               + (1.0 - _ord_ema) * _yv)
             if j is not None:
                 j_ema = torch.maximum(
                     j, (_ORD_ENV_DECAY if ladder_auto
@@ -10038,7 +10439,7 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
         if guard_active and adaptive_on and ord_px is not None:
             ord_px = torch.ones_like(ord_px)
         if not ladder_ran and lf_suppress is not None:
-            lf_suppress = _ORD_EMA * lf_suppress
+            lf_suppress = _ord_ema * lf_suppress
         if eff >= 2:
             # A/B #2: the envelope multiplier.  Shipped = the fixed 1.3; derived =
             # `sum|w_i|`, the extrapolation's own exact amplification bound.
@@ -10597,6 +10998,15 @@ def aflops_engine(model, x, sigmas, extra_args=None, callback=None, disable=None
             _raw["ord_bmax"] = _ord_bound.get("kmax")
             _raw["ord_btol"] = _ord_bound.get("tol_x0")
             _raw["ord_bper_k"] = _ord_bound.get("per_k")
+            # WHICH ARM OF THE BOUND A/B PRODUCED THIS STEP.  The switch is in the cfg dump, but a
+            # per-step record is what shows it ACTED, and `per_k`'s own 4th element already carries
+            # "applied" / "no_history" per order -- so a run can be checked for having corrected the
+            # orders it could, rather than for merely having been switched on (rule 9).
+            # WHAT THE ORDER SYSTEM WAS ASKING FOR, next to what it got.  The remainder's scale is
+            # now evaluated at the FAR END for every order that has the history for it (see
+            # `_pixel_order_bound`), and `ord_bfix` records how many it could correct this step plus
+            # the per-order `applied` / `no_history` marker inside `ord_bper_k`.
+            _raw["ord_bfix"] = _ord_bound.get("bound_fix")
         # The forced floor's own record: the value in force and how many pixels it raised.
         # `order_floor` is in the cfg dump, but a per-step count is what shows it ACTED.
         if _order_floor > 1.0:
