@@ -11,6 +11,27 @@ prompt with two small probe passes, and then uses those measurements to:
 > **Tested with Krea 2 and Anima models.** Other flow models are expected to work,
 > but have not been verified.
 
+## Provenance — what this is, and what it is not
+
+**This project began as an implementation of A-FloPS** — Jin, Xiao & Gu, *A-FloPS: Accelerating Diffusion Models via
+Adaptive Flow Path Sampler*, AAAI 2026 ([arXiv:2509.00036](https://arxiv.org/abs/2509.00036)) — **and became
+something only very loosely inspired by it.** The name was changed to PD-AOS because the old one over-claimed, so
+here is the split, stated plainly:
+
+- **From the paper:** the idea of working in a reparameterised flow time, and — still included, as two reference
+  nodes — the paper's own **Algorithm 2 ("A-Euler")**, a faithful reproduction of the authors' reference
+  implementation, kept so the original method can be compared against this sampler directly.
+- **This sampler, which is a different thing:** before sampling it measures *your* model and prompt with two small
+  probe passes, then uses those measurements to place the steps of the schedule you plug in and to decide, per region
+  of the image, how many previous steps to look at. The probes, the per-pixel order control, the Autotuner and the
+  local-field machinery are this project's own and have no counterpart in the paper.
+- **They are not the same algorithm.** On an exact analytic ODE test the paper's step parameterisation sits closer to
+  the true solution than this sampler's own step does. That is a statement about *discretisation accuracy*, not about
+  how the images look. If you want A-FloPS itself, use the paper's nodes below or the authors' implementation; if you
+  want this, use PD-AOS.
+- **The attribution stays**, and so does the comparison: the reference nodes are there so you can check the above for
+  yourself rather than take it on trust.
+
 ## What it does
 
 - **Measures first, samples second.** The probes run on tiny latents before the
